@@ -188,6 +188,11 @@ class FakeKobo:
     def _route(self, h, method, path, query, body, user) -> None:  # noqa: C901 — a router, flat on purpose
         if path == "/me/":
             return self._send(h, 200, {"username": user, "email": f"{user}@example.org"})
+        m = re.fullmatch(r"/api/v2/users/(\w+)/", path)
+        if m and method == "GET":
+            if m.group(1) not in set(TOKENS.values()) | {"kobo_ymbefree"}:
+                raise KeyError(path)
+            return self._send(h, 200, {"username": m.group(1)})
         if path == "/api/v2/assets/" and method == "GET":
             mine = [self._asset_json(a, detail=False) for a in self.assets.values()
                     if a["owner"] == user or any(u == user for u, _, _ in a["perms"])]

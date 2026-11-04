@@ -33,6 +33,10 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 class KoboError(Exception):
     """Something the employee should read: plain Ukrainian, no traceback."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 # --- places on this computer -------------------------------------------------------------------------
 
@@ -174,15 +178,16 @@ class Kobo:
                 return payload
             return json.loads(payload) if payload.strip() else None
         if status in RETRY_STATUS:
-            raise KoboError("Сервер Kobo зараз не відповідає. Спробуйте за кілька хвилин.")
+            raise KoboError("Сервер Kobo зараз не відповідає. Спробуйте за кілька хвилин.", status)
         if status == 401:
             raise KoboError("Kobo не прийняв ключ. Можливо, його змінили: попросіть працівника дати новий "
-                            "API-ключ і збережіть його командою setup.")
+                            "API-ключ і збережіть його командою setup.", status)
         if status == 403:
-            raise KoboError("Kobo каже, що у вашого акаунта немає на це прав.")
+            raise KoboError("Kobo каже, що у вашого акаунта немає на це прав.", status)
         if status == 404:
-            raise KoboError("Kobo не знайшов цю форму чи запис. Можливо, його вже видалили або код неправильний.")
-        raise KoboError(f"Kobo відхилив запит ({status}): {_kobo_says(payload)}")
+            raise KoboError("Kobo не знайшов цю форму чи запис. Можливо, його вже видалили або код неправильний.",
+                            status)
+        raise KoboError(f"Kobo відхилив запит ({status}): {_kobo_says(payload)}", status)
 
     def get(self, path: str, **kw: Any) -> Any:
         return self.request("GET", path, **kw)
@@ -217,6 +222,128 @@ def account(kobo: Kobo) -> str:
     return username
 
 
+# --- forms and sharing -----------------------------------------------------------------------------
+
+FULL = ("view_asset", "change_asset", "manage_asset", "view_submissions", "add_submissions",
+        "change_submissions", "delete_submissions", "validate_submissions")
+ROLES = {
+    "view": ("view_asset", "view_submissions"),
+    "edit": ("view_asset", "change_asset", "view_submissions", "add_submissions", "change_submissions",
+             "validate_submissions"),
+    "full": FULL,
+}
+STATUS_UA = {"deployed": "розгорнута", "draft": "чернетка, ще не розгорнута", "archived": "архівна"}
+SHARING_UA = {"full": "повні права", "partial": "не всі права", "none": "не поділена"}
+SHARING_RULE = (
+    "Правило організації: кожна форма, також тестова чи навчальна, має бути поділена з повними правами "
+    "з «Будь вільний» (kobo_ymbefree) або «Є добро» (kobo_edobro), інакше її немає в архіві й Google "
+    "Таблицях. Відмовитись не можна. Запитайте працівника, для якої організації кожна форма («Будь вільний», "
+    "«Є добро» чи обидві), і поділіться: kobo share <uid> --org bud-vilnyi|ye-dobro|both. "
+    "Де права неповні, запропонуйте доповнити їх тією самою командою."
+)
+DAILY_HEADER = "Плагін Kobo, щоденна перевірка: скажіть про це працівнику на початку розмови."
+
+
+def _last(url: str) -> str:
+    return url.rstrip("/").rsplit("/", 1)[-1]
+
+
+def grants(asset: dict) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for p in asset.get("permissions") or []:
+        out.setdefault(_last(p["user"]), set()).add(_last(p["permission"]))
+    return out
+
+
+def sharing(asset: dict) -> dict[str, str]:
+    have = grants(asset)
+    return {org: "full" if set(FULL) <= have.get(user, set()) else "partial" if have.get(user) else "none"
+            for org, (_, user) in ORGS.items()}
+
+
+def list_forms(kobo: Kobo) -> list[dict]:
+    forms = []
+    for a in kobo.pages("/api/v2/assets/", {"q": "asset_type:survey", "limit": 300}):
+        if a.get("asset_type", "survey") != "survey":
+            continue
+        if a.get("permissions") is None:
+            a = kobo.get(f"/api/v2/assets/{a['uid']}/")
+        forms.append(a)
+    return forms
+
+
+def describe(asset: dict, me: str) -> dict:
+    return {"uid": asset["uid"], "name": asset.get("name") or "", "owner": asset.get("owner__username"),
+            "mine": asset.get("owner__username") == me, "status": asset.get("deployment_status"),
+            "submissions": asset.get("deployment__submission_count") or 0, "sharing": sharing(asset)}
+
+
+def needs_sharing(form: dict) -> bool:
+    states = form["sharing"].values()
+    return "full" not in states or "partial" in states
+
+
+def sharing_problems(kobo: Kobo) -> tuple[str, list[dict]]:
+    me = account(kobo)
+    return me, [f for f in (describe(a, me) for a in list_forms(kobo)) if f["mine"] and needs_sharing(f)]
+
+
+def problem_text(problems: list[dict]) -> str:
+    lines = ["Ці форми працівника ще не поділені з організацією як слід:"]
+    for f in problems:
+        partial = [f"«{ORGS[o][0]}»: не всі права" for o, s in f["sharing"].items() if s == "partial"]
+        what = "; ".join(partial) if partial else "не поділена з жодною організацією"
+        lines.append(f"• «{f['name']}» ({f['uid']}) — {what}")
+    return "\n".join(lines + [SHARING_RULE])
+
+
+def grant(kobo: Kobo, uid: str, user: str, perms: tuple[str, ...]) -> None:
+    """Add the missing permissions one at a time; never touches anyone else's access."""
+    asset = kobo.get(f"/api/v2/assets/{uid}/")
+    assignable = {_last(p["url"]) for p in asset.get("assignable_permissions") or []} or set(perms)
+    wanted = [p for p in perms if p in assignable]
+    have = grants(asset).get(user, set())
+    for perm in wanted:
+        if perm not in have:
+            # 400 can mean "already implied by another permission"; the re-read below decides.
+            kobo.post(f"/api/v2/assets/{uid}/permission-assignments/",
+                      {"user": f"{kobo.base}/api/v2/users/{user}/",
+                       "permission": f"{kobo.base}/api/v2/permissions/{perm}/"}, ok=(200, 201, 400))
+    now = grants(kobo.get(f"/api/v2/assets/{uid}/")).get(user, set())
+    missing = [p for p in wanted if p not in now]
+    if missing:
+        raise KoboError(f"Kobo не видав акаунту {user} права {', '.join(missing)} на форму {uid}. "
+                        f"Спробуйте ще раз; якщо повториться, зверніться до адміністратора: {ADMIN}.")
+
+
+def org_keys(org: str) -> list[str]:
+    return list(ORGS) if org == "both" else [org]
+
+
+def share_with_orgs(kobo: Kobo, uid: str, org: str) -> str:
+    keys = org_keys(org)
+    for key in keys:
+        grant(kobo, uid, ORGS[key][1], FULL)
+    return " і ".join(f"«{ORGS[k][0]}» ({ORGS[k][1]})" for k in keys)
+
+
+def daily_check() -> int:
+    today = time.strftime("%Y-%m-%d")
+    if load_state().get("sharing_ok_on") == today:
+        return 0
+    try:
+        _, problems = sharing_problems(Kobo(server(), load_token(), timeout=15, retry=False))
+    except KoboError:
+        return 0  # not set up yet, or Kobo unreachable: stay quiet and try next session
+    if problems:
+        print(DAILY_HEADER + "\n" + problem_text(problems))
+    else:
+        state = load_state()
+        state["sharing_ok_on"] = today
+        save_state(state)
+    return 0
+
+
 # --- commands ----------------------------------------------------------------------------------------
 
 
@@ -228,7 +355,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     try:
         me = Kobo(server(), token).get("/me/")
     except KoboError as e:
-        if "не прийняв ключ" not in str(e):
+        if e.status != 401:
             raise
         me = {}
     username = (me or {}).get("username")
@@ -255,11 +382,104 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_forms(args: argparse.Namespace) -> int:
+    kobo = client()
+    me = account(kobo)
+    forms = [describe(a, me) for a in list_forms(kobo)]
+    if args.json:
+        print(json.dumps(forms, ensure_ascii=False, indent=1))
+        return 0
+    if not forms:
+        print("У цьому акаунті ще немає жодної форми.")
+    for f in forms:
+        orgs = "; ".join(f"{ORGS[o][0]}: {SHARING_UA[s]}" for o, s in f["sharing"].items())
+        owner = "" if f["mine"] else f", власник: {f['owner']}"
+        print(f"• «{f['name']}» — {f['uid']} — {STATUS_UA.get(f['status'], f['status'])}, "
+              f"відповідей: {f['submissions']}{owner} — {orgs}")
+    return 0
+
+
+def cmd_check_sharing(args: argparse.Namespace) -> int:
+    if args.daily:
+        return daily_check()
+    me, problems = sharing_problems(client())
+    if args.json:
+        print(json.dumps({"account": me, "problems": problems}, ensure_ascii=False, indent=1))
+    elif problems:
+        print(problem_text(problems))
+    else:
+        print("Усі ваші форми поділені з організацією з повними правами.")
+    return 1 if problems else 0
+
+
+def cmd_share(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    names = share_with_orgs(kobo, args.uid, args.org)
+    print(f"Готово: форма {args.uid} поділена з {names} з повними правами. Вона потрапить у нічний архів, "
+          "а після розгортання (Deploy) — і в Google Таблицю організації.")
+    return 0
+
+
+def cmd_share_user(args: argparse.Namespace) -> int:
+    if args.username in MAIN_ACCOUNTS:
+        raise KoboError("Головні акаунти організацій додаються командою share --org.")
+    kobo = client()
+    account(kobo)
+    try:
+        kobo.get(f"/api/v2/users/{args.username}/")
+    except KoboError as e:
+        if e.status == 404:
+            raise KoboError(f"Користувача {args.username} на eu.kobotoolbox.org немає. Потрібен логін "
+                            "(username) колеги, не email.") from None
+        raise
+    grant(kobo, args.uid, args.username, ROLES[args.role])
+    print(f"Готово: {args.username} має доступ до форми {args.uid} ({args.role}).")
+    return 0
+
+
+def cmd_unshare_user(args: argparse.Namespace) -> int:
+    if args.username in MAIN_ACCOUNTS:
+        raise KoboError(f"Доступ головного акаунта {args.username} відкликати не можна: без нього форма зникне "
+                        "з архіву й Google Таблиць організації.")
+    kobo = client()
+    if args.username == account(kobo):
+        raise KoboError("Власний доступ відкликати не можна.")
+    path = f"/api/v2/assets/{args.uid}/"
+    for p in kobo.get(path).get("permissions") or []:
+        if _last(p["user"]) == args.username:
+            kobo.delete(p["url"], ok=(204, 404))  # removing one may already have removed implied ones
+    if grants(kobo.get(path)).get(args.username):
+        raise KoboError(f"Kobo не відкликав усі права {args.username}. Спробуйте ще раз.")
+    print(f"Готово: {args.username} більше не має доступу до форми {args.uid}.")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kobo", description="Робота з KoboToolbox (eu.kobotoolbox.org) за правилами організації.")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("setup", help="зберегти API-ключ (ключ подається на stdin)").set_defaults(func=cmd_setup)
     sub.add_parser("whoami", help="який акаунт підключено").set_defaults(func=cmd_whoami)
+    s = sub.add_parser("forms", help="усі форми: свої й поділені, стан поширення")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_forms)
+    s = sub.add_parser("check-sharing", help="свої форми, не поділені з організацією")
+    s.add_argument("--daily", action="store_true", help="для щоденної перевірки на початку сесії")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_check_sharing)
+    s = sub.add_parser("share", help="поділитися формою з головним акаунтом організації (повні права)")
+    s.add_argument("uid")
+    s.add_argument("--org", required=True, choices=[*ORGS, "both"])
+    s.set_defaults(func=cmd_share)
+    s = sub.add_parser("share-user", help="дати доступ колезі")
+    s.add_argument("uid")
+    s.add_argument("username")
+    s.add_argument("--role", required=True, choices=list(ROLES))
+    s.set_defaults(func=cmd_share_user)
+    s = sub.add_parser("unshare-user", help="відкликати доступ колеги")
+    s.add_argument("uid")
+    s.add_argument("username")
+    s.set_defaults(func=cmd_unshare_user)
     return p
 
 
