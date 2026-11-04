@@ -70,6 +70,13 @@ class BackupTest(KoboTestCase):
         self.run_cli("backup", "aForm")
         self.assertEqual(self.fake.calls("GET", "/versions/"), [])
 
+    def test_backup_of_a_never_deployed_form(self):
+        self.fake.add_form("aDraft", "Чернетка", deployed=False)
+        code, out, err = self.run_cli("backup", "aDraft")
+        self.assertEqual(code, 0, err)
+        [copy] = self.backup_dirs("aDraft")
+        self.assertEqual(json.loads((copy / "submissions.json").read_text()), [])
+
     def test_failed_backup_leaves_no_copy(self):
         self.fake.fail[("GET", "/api/v2/assets/aForm/data/")] = [500] * 4
         code, out, err = self.run_cli("backup", "aForm")

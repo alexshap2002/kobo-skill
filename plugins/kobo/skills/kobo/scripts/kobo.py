@@ -543,7 +543,11 @@ def xlsform_url(asset: dict) -> str | None:
     return None
 
 
-def fetch_answers(kobo: Kobo, uid: str) -> list[dict]:
+def fetch_answers(kobo: Kobo, uid: str, asset: dict | None = None) -> list[dict]:
+    """All answers. A form that was never deployed has none, and Kobo answers 400 if asked."""
+    asset = asset if asset is not None else kobo.get(f"/api/v2/assets/{uid}/")
+    if not asset.get("has_deployment"):
+        return []
     return list(kobo.pages(f"/api/v2/assets/{uid}/data/", {"limit": 1000}))
 
 
@@ -563,7 +567,7 @@ def make_backup(kobo: Kobo, uid: str, reason: str, answers: list[dict] | None = 
             known[v["uid"]] = {"uid": v["uid"], "date_deployed": v["date_deployed"],
                                "content": kobo.get(f"/api/v2/assets/{uid}/versions/{v['uid']}/").get("content")}
         versions.append(known[v["uid"]])
-    answers = fetch_answers(kobo, uid) if answers is None else answers
+    answers = fetch_answers(kobo, uid, asset) if answers is None else answers
     note = ""
     xls = None
     try:
@@ -1014,7 +1018,7 @@ def cmd_update_form(args: argparse.Namespace) -> int:
     account(kobo)
     new = checked_content(args.content)
     asset = kobo.get(f"/api/v2/assets/{args.uid}/")
-    records = fetch_answers(kobo, args.uid)
+    records = fetch_answers(kobo, args.uid, asset)
     risks = risky_changes(live_content(kobo, asset), new, records)
     if risks and not args.force:
         raise KoboError("Зміну не зроблено, бо вона зачіпає питання, на які вже є відповіді:\n• "
@@ -1059,7 +1063,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     kobo = client()
     account(kobo)
     asset = kobo.get(f"/api/v2/assets/{args.uid}/")
-    records = fetch_answers(kobo, args.uid)
+    records = fetch_answers(kobo, args.uid, asset)
     out = Path(args.out) if args.out else Path.cwd() / (
         f"{safe_name(asset.get('name') or args.uid)}_{time.strftime('%Y-%m-%d')}.{args.format}")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1141,7 +1145,7 @@ def cmd_delete_submissions(args: argparse.Namespace) -> int:
     kobo = client()
     account(kobo)
     asset = kobo.get(f"/api/v2/assets/{args.uid}/")
-    records = fetch_answers(kobo, args.uid)
+    records = fetch_answers(kobo, args.uid, asset)
     doomed = pick(records, parse_ids(args.ids))
     files = with_files(doomed)
     if not args.yes:
@@ -1165,7 +1169,7 @@ def cmd_delete_form(args: argparse.Namespace) -> int:
     kobo = client()
     account(kobo)
     asset = kobo.get(f"/api/v2/assets/{args.uid}/")
-    records = fetch_answers(kobo, args.uid)
+    records = fetch_answers(kobo, args.uid, asset)
     files = with_files(records)
     if not args.yes:
         print(f"Буде видалено форму «{asset.get('name')}» ({args.uid}) разом з усіма {len(records)} відповідями"

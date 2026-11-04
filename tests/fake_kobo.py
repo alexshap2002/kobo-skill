@@ -260,6 +260,8 @@ class FakeKobo:
                 if "active" in body:
                     a["active"] = bool(body["active"])
                 return self._send(h, 200, {"active": a["active"]})
+        if rest.startswith("data/") and not a["has_deployment"]:
+            return self._send(h, 400, {"detail": "The specified asset has not been deployed"})  # real kpi
         if rest == "data/" and method == "GET":
             return self._page(h, f"/api/v2/assets/{uid}/data/", self.data[uid], query)
         if rest == "data/bulk/" and method == "PATCH":
