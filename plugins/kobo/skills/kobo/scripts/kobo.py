@@ -19,7 +19,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
+from xml.sax.saxutils import escape
 from typing import Any, Iterator
 
 SERVER = "https://eu.kobotoolbox.org"
@@ -28,6 +30,7 @@ MAIN_ACCOUNTS = {user for _, user in ORGS.values()}
 ADMIN = "Олександр Шаповалов (Telegram @olexandr_shapovalov)"
 RETRY_DELAYS = (2, 5, 15)
 RETRY_STATUS = {429, 500, 502, 503, 504}
+KEEP_COPIES = 5
 
 
 class KoboError(Exception):
@@ -47,6 +50,10 @@ def server() -> str:
 
 def home() -> Path:
     return Path(os.environ.get("KOBO_HOME") or Path.home() / ".kobo")
+
+
+def backup_root() -> Path:
+    return Path(os.environ.get("KOBO_BACKUP_DIR") or Path.home() / "Kobo-копії")
 
 
 def save_token(token: str) -> None:
@@ -327,6 +334,15 @@ def share_with_orgs(kobo: Kobo, uid: str, org: str) -> str:
     return " і ".join(f"«{ORGS[k][0]}» ({ORGS[k][1]})" for k in keys)
 
 
+def deploy(kobo: Kobo, uid: str, active: bool = True) -> None:
+    """Deploy the current version: first time POST, afterwards PATCH with the version."""
+    asset = kobo.get(f"/api/v2/assets/{uid}/")
+    if asset.get("has_deployment"):
+        kobo.patch(f"/api/v2/assets/{uid}/deployment/", {"active": active, "version_id": asset["version_id"]})
+    else:
+        kobo.post(f"/api/v2/assets/{uid}/deployment/", {"active": True})
+
+
 def daily_check() -> int:
     today = time.strftime("%Y-%m-%d")
     if load_state().get("sharing_ok_on") == today:
@@ -342,6 +358,267 @@ def daily_check() -> int:
         state["sharing_ok_on"] = today
         save_state(state)
     return 0
+
+
+# --- Excel without dependencies ----------------------------------------------------------------------
+
+_BAD_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _col(n: int) -> str:
+    name = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        name = chr(65 + r) + name
+    return name
+
+
+def write_xlsx(path: Path, sheets: list[tuple[str, list[list[Any]]]]) -> None:
+    """A plain .xlsx (inline strings, no styles) that Excel, LibreOffice and Google Sheets open."""
+    def cell(ref: str, value: Any) -> str:
+        if isinstance(value, bool) or value is None:
+            value = "" if value is None else str(value)
+        if isinstance(value, (int, float)):
+            return f'<c r="{ref}"><v>{value}</v></c>'
+        text = escape(_BAD_XML.sub("", str(value)))[:32000]
+        return f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+    used: set[str] = set()
+    titles = []
+    for name, _ in sheets:
+        title = re.sub(r"[\[\]:*?/\\]", "_", name)[:31] or "Аркуш"
+        while title in used:
+            title = title[:28] + f"_{len(used)}"
+        used.add(title)
+        titles.append(title)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", (
+            '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            + "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                      for i in range(1, len(sheets) + 1)) + "</Types>"))
+        z.writestr("_rels/.rels", (
+            '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>"))
+        z.writestr("xl/workbook.xml", (
+            '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+            + "".join(f'<sheet name="{escape(t, {chr(34): "&quot;"})}" sheetId="{i}" r:id="rId{i}"/>' for i, t in enumerate(titles, 1))
+            + "</sheets></workbook>"))
+        z.writestr("xl/_rels/workbook.xml.rels", (
+            '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            + "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>'
+                      for i in range(1, len(sheets) + 1)) + "</Relationships>"))
+        for i, (_, rows) in enumerate(sheets, 1):
+            body = "".join(
+                f'<row r="{r}">' + "".join(cell(f"{_col(c)}{r}", v) for c, v in enumerate(row, 1)) + "</row>"
+                for r, row in enumerate(rows, 1))
+            z.writestr(f"xl/worksheets/sheet{i}.xml", (
+                '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f"<sheetData>{body}</sheetData></worksheet>"))
+
+
+# --- answers as human tables -------------------------------------------------------------------------
+
+SYSTEM_COLUMNS = {"_id": "ID запису", "_submission_time": "Час подання", "_validation_status": "Статус перевірки",
+                  "_submitted_by": "Хто подав"}
+HIDDEN = {"_uuid", "_attachments", "_status", "_geolocation", "_tags", "_notes", "_xform_id_string", "_xform_id",
+          "__version__", "_version_", "_bamboo_dataset_id", "formhub/uuid", "meta/instanceID", "meta/rootUuid",
+          "meta/deprecatedID", "meta/instanceName", "_media_count", "_media_all_received", "_total_media",
+          "_supplementalDetails"}
+NUMERIC = {"integer", "decimal", "range"}
+
+
+def _label(row: dict) -> str:
+    label = row.get("label")
+    if isinstance(label, list):
+        label = next((x for x in label if x), "")
+    return label or ""
+
+
+def form_dictionary(content: dict) -> dict:
+    """name -> (label, type, choices) from kpi content; names are unique within a form."""
+    choices: dict[str, dict[str, str]] = {}
+    for c in content.get("choices") or []:
+        choices.setdefault(c.get("list_name"), {})[str(c.get("name"))] = _label(c) or str(c.get("name"))
+    out = {}
+    for row in content.get("survey") or []:
+        name = row.get("name") or row.get("$autoname")
+        if name:
+            kind = str(row.get("type", "")).split(" ")[0]
+            out[name] = (_label(row) or name, kind, choices.get(row.get("select_from_list_name"), {}))
+    return out
+
+
+def answer_tables(records: list[dict], content: dict) -> list[tuple[str, list[list[Any]]]]:
+    """One sheet for the answers and one per repeat group, with labels instead of codes."""
+    words = form_dictionary(content)
+    order = {name: i for i, name in enumerate(words)}
+    sheets: dict[str, list[dict]] = {"": []}
+
+    def walk(record: dict, sheet: str, parent: Any) -> None:
+        row: dict = {} if parent is None else {"_parent": parent}
+        for key, value in record.items():
+            if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+                for item in value:
+                    walk(item, key, record.get("_id", parent))
+            elif key not in HIDDEN:
+                row[key] = value
+        sheets.setdefault(sheet, []).append(row)
+
+    for record in records:
+        walk(record, "", None)
+
+    def show(key: str, value: Any) -> Any:
+        if key == "_validation_status":
+            return (value or {}).get("label", "") if isinstance(value, dict) else value
+        label, kind, options = words.get(key.rsplit("/", 1)[-1], ("", "", {}))
+        if kind == "select_one":
+            return options.get(str(value), value)
+        if kind == "select_multiple" and isinstance(value, str):
+            return "; ".join(options.get(v, v) for v in value.split())
+        if kind in NUMERIC and isinstance(value, str):
+            try:
+                return int(value) if re.fullmatch(r"-?\d+", value) else float(value)
+            except ValueError:
+                return value
+        return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
+
+    result = []
+    for sheet, rows in sheets.items():
+        if sheet and not rows:
+            continue
+        keys: list[str] = []
+        for row in rows:
+            keys += [k for k in row if k not in keys]
+        keys.sort(key=lambda k: (k not in ("_parent", "_id"), k.startswith("_"),
+                                 order.get(k.rsplit("/", 1)[-1], len(order))))
+        header = [("ID запису (батьківський)" if k == "_parent" else SYSTEM_COLUMNS.get(k)
+                   or words.get(k.rsplit("/", 1)[-1], (k,))[0]) for k in keys]
+        title = "Відповіді" if not sheet else words.get(sheet.rsplit("/", 1)[-1], (sheet,))[0]
+        result.append((title, [header] + [[show(k, row.get(k, "")) for k in keys] for row in rows]))
+    return result
+
+
+# --- local copies ------------------------------------------------------------------------------------
+
+STAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(-\d+)?")
+
+
+def safe_name(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name).strip(" .")[:60].strip(" .") or "форма"
+
+
+def copies(uid: str) -> list[Path]:
+    """Finished copies of one form, newest first."""
+    root = backup_root()
+    folders = list(root.glob(f"*__{uid}")) if root.is_dir() else []
+    found = [p for f in folders for p in f.iterdir() if p.is_dir() and STAMP.fullmatch(p.name)]
+    return sorted(found, key=lambda p: p.name, reverse=True)
+
+
+def deployed_versions(kobo: Kobo, asset: dict) -> list[dict]:
+    """Deployed versions, oldest first. Paged only when the asset's own list is truncated."""
+    listing = asset.get("deployed_versions") or {}
+    items = listing.get("results") or []
+    if listing.get("count") != len(items):
+        items = list(kobo.pages(f"/api/v2/assets/{asset['uid']}/versions/", {"limit": 1000}))
+    items = [v for v in items if v.get("date_deployed") and re.fullmatch(r"\w+", str(v.get("uid")))]
+    return sorted(items, key=lambda v: (str(v["date_deployed"]), v["uid"]))
+
+
+def xlsform_url(asset: dict) -> str | None:
+    for d in asset.get("downloads") or []:
+        if str(d.get("format", "")).lower() in ("xls", "xlsx") and d.get("url"):
+            return d["url"]
+    return None
+
+
+def fetch_answers(kobo: Kobo, uid: str) -> list[dict]:
+    return list(kobo.pages(f"/api/v2/assets/{uid}/data/", {"limit": 1000}))
+
+
+def make_backup(kobo: Kobo, uid: str, reason: str) -> Path:
+    """Copy one form (description, versions, all answers; never photos) and keep the newest copies."""
+    asset = kobo.get(f"/api/v2/assets/{uid}/")
+    previous = copies(uid)
+    known: dict[str, dict] = {}
+    if previous:
+        try:
+            known = {v["uid"]: v for v in json.loads((previous[0] / "versions.json").read_text(encoding="utf-8"))}
+        except (OSError, ValueError, KeyError, TypeError):
+            known = {}
+    versions = []
+    for v in deployed_versions(kobo, asset):
+        if v["uid"] not in known:
+            known[v["uid"]] = {"uid": v["uid"], "date_deployed": v["date_deployed"],
+                               "content": kobo.get(f"/api/v2/assets/{uid}/versions/{v['uid']}/").get("content")}
+        versions.append(known[v["uid"]])
+    answers = fetch_answers(kobo, uid)
+    note = ""
+    xls = None
+    try:
+        url = xlsform_url(asset)
+        xls = kobo.get(url, raw=True) if url else None
+    except KoboError:
+        pass
+    if xls is None:
+        note = "\nФайл form.xlsx Kobo не віддав; повний опис форми є в asset.json і versions.json."
+
+    folder = previous[0].parent if previous else backup_root() / f"{safe_name(asset.get('name') or '')}__{uid}"
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    final, n = folder / stamp, 1
+    while final.exists():
+        n += 1
+        final = folder / f"{stamp}-{n:02d}"
+    tmp = folder / f".unfinished-{final.name}"
+    tmp.mkdir(parents=True)
+    content = asset.get("content") or {}
+    (tmp / "asset.json").write_text(json.dumps(asset, ensure_ascii=False, indent=1), encoding="utf-8")
+    (tmp / "versions.json").write_text(json.dumps(versions, ensure_ascii=False, indent=1), encoding="utf-8")
+    (tmp / "submissions.json").write_text(json.dumps(answers, ensure_ascii=False, indent=1), encoding="utf-8")
+    if xls is not None:
+        (tmp / "form.xlsx").write_bytes(xls)
+    write_xlsx(tmp / "submissions.xlsx", answer_tables(answers, content))
+    (tmp / "ПРО_КОПІЮ.txt").write_text(
+        f"Копія форми «{asset.get('name')}» ({uid}) з eu.kobotoolbox.org\n"
+        f"Зроблено: {time.strftime('%Y-%m-%d %H:%M:%S')} — {reason}\n"
+        f"Відповідей: {len(answers)}. Розгорнутих версій форми: {len(versions)}.{note}\n\n"
+        "Що тут є:\n"
+        "- submissions.xlsx — усі відповіді для перегляду в Excel;\n"
+        "- submissions.json — усі відповіді (для відновлення);\n"
+        "- form.xlsx — форма (XLSForm) на момент копії;\n"
+        "- asset.json, versions.json — повний опис форми й усі її розгорнуті версії.\n"
+        "Фото й файли до копії не входять.\n\n"
+        "Повернути форму до цієї копії: попросіть Claude «поверни форму до копії».\n"
+        f"Повернути відповіді: адміністратор {ADMIN}.\n", encoding="utf-8")
+    os.replace(tmp, final)
+    for old in copies(uid)[KEEP_COPIES:]:
+        _remove_tree(old)
+    return final
+
+
+def _remove_tree(path: Path) -> None:
+    for p in sorted(path.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+        p.rmdir() if p.is_dir() else p.unlink()
+    path.rmdir()
+
+
+def find_copy(uid: str, which: str) -> Path:
+    if which == "latest":
+        found = copies(uid)
+        if not found:
+            raise KoboError(f"Локальних копій форми {uid} на цьому комп'ютері немає.")
+        return found[0]
+    path = Path(which).expanduser()
+    if not path.is_absolute():
+        path = next((p for p in copies(uid) if p.name == which), path)
+    if not (path / "asset.json").is_file():
+        raise KoboError(f"Копії {which} не знайдено. Подивіться список: kobo backups {uid}.")
+    return path
 
 
 # --- commands ----------------------------------------------------------------------------------------
@@ -455,6 +732,46 @@ def cmd_unshare_user(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    path = make_backup(kobo, args.uid, args.reason)
+    print(f"Копію зроблено: {path}")
+    return 0
+
+
+def cmd_backups(args: argparse.Namespace) -> int:
+    found = copies(args.uid)
+    if not found:
+        print(f"Локальних копій форми {args.uid} немає.")
+    for p in found:
+        print(f"• {p.name} — {p}")
+    return 0
+
+
+def cmd_restore_form(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    source = find_copy(args.uid, args.backup)
+    saved = json.loads((source / "asset.json").read_text(encoding="utf-8"))
+    if saved.get("uid") != args.uid:
+        raise KoboError(f"Копія {source.name} належить іншій формі ({saved.get('uid')}), не {args.uid}.")
+    versions = {v["uid"]: v for v in json.loads((source / "versions.json").read_text(encoding="utf-8"))}
+    live = versions.get(saved.get("deployed_version_id") or "")
+    content = live["content"] if live else saved.get("content")
+    if not content:
+        raise KoboError(f"У копії {source.name} немає опису форми.")
+    fresh = make_backup(kobo, args.uid, f"перед поверненням до копії {source.name}")
+    kobo.patch(f"/api/v2/assets/{args.uid}/", {"content": content})
+    asset = kobo.get(f"/api/v2/assets/{args.uid}/")
+    if asset.get("has_deployment"):
+        deploy(kobo, args.uid, active=bool(asset.get("deployment__active", True)))
+    print(f"Готово: форму {args.uid} повернуто до копії {source.name}"
+          + (" і розгорнуто." if asset.get("has_deployment") else ".")
+          + f" Стан перед поверненням збережено в {fresh}.")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kobo", description="Робота з KoboToolbox (eu.kobotoolbox.org) за правилами організації.")
     sub = p.add_subparsers(dest="command", required=True)
@@ -480,6 +797,17 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("uid")
     s.add_argument("username")
     s.set_defaults(func=cmd_unshare_user)
+    s = sub.add_parser("backup", help="локальна копія форми й усіх відповідей (без фото)")
+    s.add_argument("uid")
+    s.add_argument("--reason", default="копія на прохання працівника")
+    s.set_defaults(func=cmd_backup)
+    s = sub.add_parser("backups", help="список локальних копій форми")
+    s.add_argument("uid")
+    s.set_defaults(func=cmd_backups)
+    s = sub.add_parser("restore-form", help="повернути форму до локальної копії (спершу нова копія)")
+    s.add_argument("uid")
+    s.add_argument("--backup", required=True, help="latest, назва копії (дата-час) або шлях до неї")
+    s.set_defaults(func=cmd_restore_form)
     return p
 
 
