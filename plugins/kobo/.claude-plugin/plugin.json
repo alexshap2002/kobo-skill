@@ -1,7 +1,6 @@
 {
   "name": "kobo",
   "description": "Форми, відповіді й звіти KoboToolbox (eu.kobotoolbox.org) для працівників «Будь вільний» і «Є добро»: копія перед кожною зміною, кожна форма поділена з організацією.",
-  "version": "1.0.0",
   "author": {
     "name": "Олександр Шаповалов",
     "url": "https://github.com/alexshap2002"

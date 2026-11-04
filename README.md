@@ -20,22 +20,45 @@
 
 1. **Claude Code**: застосунок, термінал або розширення VS Code.
 2. **Особистий акаунт** на eu.kobotoolbox.org. Не головний акаунт організації: ним працювати не можна.
-3. **Python 3.9 або новіший.** Якщо Python немає, Claude підкаже, як його поставити.
-   - **Mac:** у Терміналі виконайте `xcode-select --install` або встановіть Python з python.org.
-   - **Windows:** встановіть Python з [python.org](https://www.python.org/downloads/) і поставте галочку «Add python.exe to PATH».
+3. **Python 3.9 або новіший і git.** Якщо чогось немає, Claude підкаже, як поставити.
+   - **Mac:** у Терміналі виконайте `xcode-select --install`. Ця команда ставить і Python, і git.
+   - **Windows:** git уже є разом із Claude Code. Python встановіть з [python.org](https://www.python.org/downloads/) і поставте галочку «Add python.exe to PATH».
 
 ## Встановлення (один раз)
 
-У Claude Code введіть по черзі:
+Найпростіше: напишіть Claude Code
+
+> Встанови плагін https://github.com/alexshap2002/kobo-skill
+
+Claude сам усе встановить, увімкне автооновлення й попросить перезапустити Claude Code.
+
+Встановити можна й вручну. Введіть у Claude Code по черзі:
 
 ```
-/plugin marketplace add alexshap2002/kobo-skill
+/plugin marketplace add https://github.com/alexshap2002/kobo-skill
 /plugin install kobo@kobo-skill
 ```
 
-Потім перезапустіть Claude Code.
+Потім: `/plugin` → вкладка **Marketplaces** → **kobo-skill** → **Enable auto-update**. Після цього
+перезапустіть Claude Code.
 
-**Щоб оновлення приходили самі:** `/plugin` → вкладка **Marketplaces** → **kobo-skill** → **Enable auto-update**.
+**Оновлення** приходять самі: Claude Code перевіряє їх під час роботи і вмикає нову версію з наступним
+запуском. Натискати нічого не треба.
+
+### Для Claude: як встановити цей плагін
+
+Виконай у терміналі:
+
+1. Додай маркетплейс і встанови плагін:
+   ```bash
+   claude plugin marketplace add https://github.com/alexshap2002/kobo-skill
+   claude plugin install kobo@kobo-skill
+   ```
+2. Увімкни автооновлення. У `~/.claude/settings.json` перша команда вже створила запис
+   `extraKnownMarketplaces["kobo-skill"]`. Додай у нього `"autoUpdate": true`, а `source` не змінюй.
+3. Перевір, що є Python 3.9+ (`python3 --version`; на Windows також `python --version`) і `git`. Якщо
+   чогось нема, допоможи встановити (див. «Що потрібно»).
+4. Попроси працівника перезапустити Claude Code. Потім хай напише «Підключи мій Kobo».
 
 ## Перший запуск
 
@@ -73,3 +96,4 @@ Claude збереже ключ у файл на вашому комп'ютері
 - Щоденну перевірку на початку сесії робить `plugins/kobo/hooks/`.
 - Ключ зберігається у `~/.kobo/token` з правами 0600. Копії лежать у `~/Kobo-копії/<форма>__<uid>/<дата-час>/`.
 - Тести працюють на фейковому Kobo: `python3 -m unittest discover -s tests`. CI ганяє їх на Linux, Mac і Windows.
+- Номера версії в `plugin.json` немає навмисно. Версією стає коміт, тож кожен push до `main` доходить до всіх як оновлення.

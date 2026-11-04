@@ -17,6 +17,7 @@ import ssl
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import uuid
 import urllib.parse
@@ -170,7 +171,7 @@ class Kobo:
             except urllib.error.HTTPError as e:
                 status, payload = e.code, e.read()
             except (urllib.error.URLError, OSError) as e:
-                if attempt < len(delays):
+                if attempt < len(delays) and method == "GET":
                     time.sleep(delays[attempt])
                     continue
                 if isinstance(getattr(e, "reason", None), ssl.SSLError):
@@ -178,7 +179,8 @@ class Kobo:
                                     f"Зверніться до адміністратора: {ADMIN}.") from None
                 raise KoboError(f"Немає зв'язку з {urllib.parse.urlsplit(self.base).hostname}. "
                                 "Перевірте інтернет і спробуйте ще раз.") from None
-            if status in RETRY_STATUS and attempt < len(delays):
+            # A write that timed out or got 5xx may still have happened: repeating it could duplicate a form.
+            if (status == 429 or (method == "GET" and status in RETRY_STATUS)) and attempt < len(delays):
                 time.sleep(delays[attempt])
                 continue
             break
@@ -801,6 +803,18 @@ STATUSES = {"approved": "validation_status_approved", "not_approved": "validatio
             "on_hold": "validation_status_on_hold"}
 
 
+STATUS_UA = {"approved": "Схвалено", "not_approved": "Не схвалено", "on_hold": "Відкладено"}
+
+
+def answers_n(n: int) -> str:
+    """1 відповідь, 2 відповіді, 5 відповідей: Ukrainian counts need three forms."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} відповідь"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} відповіді"
+    return f"{n} відповідей"
+
+
 def parse_ids(text: str) -> list[int]:
     ids: list[int] = []
     for part in text.replace(" ", "").split(","):
@@ -1082,7 +1096,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                 with open(path, "w", encoding="utf-8-sig", newline="") as f:
                     csv.writer(f).writerows(rows)
                 written.append(path)
-    print(f"Вивантажено {len(records)} відповідей: " + ", ".join(str(p) for p in written))
+    print(f"Вивантажено {answers_n(len(records))}: " + ", ".join(str(p) for p in written))
     return 0
 
 
@@ -1125,7 +1139,7 @@ def cmd_set_values(args: argparse.Namespace) -> int:
     ids = [r["_id"] for r in pick(records, parse_ids(args.ids))]
     path = make_backup(kobo, args.uid, f"перед зміною значень у записах {args.ids}", answers=records)
     kobo.patch(f"/api/v2/assets/{args.uid}/data/bulk/", {"payload": {"submission_ids": ids, "data": data}})
-    print(f"Змінено {len(ids)} відповідей. Копія до зміни: {path}.")
+    print(f"Змінено {answers_n(len(ids))}. Копія до зміни: {path}.")
     return 0
 
 
@@ -1137,7 +1151,7 @@ def cmd_set_status(args: argparse.Namespace) -> int:
     path = make_backup(kobo, args.uid, f"перед зміною статусу записів {args.ids}", answers=records)
     kobo.patch(f"/api/v2/assets/{args.uid}/data/validation_statuses/",
                {"payload": {"submission_ids": ids, "validation_status.uid": STATUSES[args.status]}})
-    print(f"Статус «{args.status}» поставлено {len(ids)} відповідям. Копія до зміни: {path}.")
+    print(f"Статус «{STATUS_UA[args.status]}» поставлено: {answers_n(len(ids))}. Копія до зміни: {path}.")
     return 0
 
 
@@ -1149,9 +1163,9 @@ def cmd_delete_submissions(args: argparse.Namespace) -> int:
     doomed = pick(records, parse_ids(args.ids))
     files = with_files(doomed)
     if not args.yes:
-        print(f"Буде видалено {len(doomed)} відповідей з форми «{asset.get('name')}» ({args.uid}): ID "
+        print(f"Буде видалено {answers_n(len(doomed))} з форми «{asset.get('name')}» ({args.uid}): ID "
               + ", ".join(str(r["_id"]) for r in doomed) + "."
-              + (f" {files} з них мають фото чи файли: після видалення їх не повернути, бо фото не входять "
+              + (f" З фото чи файлами серед них: {files}. Після видалення фото не повернути, бо вони не входять "
                  "ні в локальну копію, ні в центральний архів." if files else "")
               + " Kobo видалених відповідей не повертає; локальна копія буде зроблена перед видаленням, "
               "а центральний архів має нічну копію (без фото). Покажіть це працівнику і, якщо він скаже "
@@ -1160,8 +1174,8 @@ def cmd_delete_submissions(args: argparse.Namespace) -> int:
     path = make_backup(kobo, args.uid, f"перед видаленням записів {args.ids}", answers=records)
     for record in doomed:
         kobo.delete(f"/api/v2/assets/{args.uid}/data/{int(record['_id'])}/")
-    print(f"Видалено {len(doomed)} відповідей. Копія до видалення: {path}. Повернути їх може адміністратор "
-          f"{ADMIN} з копії чи центрального архіву" + (" (без фото)." if files else "."))
+    print(f"Видалено {answers_n(len(doomed))}. Копія до видалення: {path}. Повернути їх може адміністратор "
+          f"з копії чи центрального архіву" + (" (без фото)" if files else "") + f". Адміністратор: {ADMIN}.")
     return 0
 
 
@@ -1172,16 +1186,16 @@ def cmd_delete_form(args: argparse.Namespace) -> int:
     records = fetch_answers(kobo, args.uid, asset)
     files = with_files(records)
     if not args.yes:
-        print(f"Буде видалено форму «{asset.get('name')}» ({args.uid}) разом з усіма {len(records)} відповідями"
-              + (f", з них {files} з фото чи файлами" if files else "") + ". Видалена форма 7 днів лежить у "
+        print(f"Буде видалено форму «{asset.get('name')}» ({args.uid}) разом з усіма відповідями ({len(records)}"
+              + (f", з фото чи файлами: {files}" if files else "") + "). Видалена форма 7 днів лежить у "
               "кошику Kobo (повернути її разом із фото може адміністратор через підтримку Kobo), потім зникає "
               "назавжди. Локальна копія буде зроблена перед видаленням (без фото). Покажіть це працівнику і, "
               "якщо він скаже «так», повторіть команду з --yes.")
         return 1
     path = make_backup(kobo, args.uid, "перед видаленням форми", answers=records)
     kobo.delete(f"/api/v2/assets/{args.uid}/")
-    print(f"Форму «{asset.get('name')}» видалено. 7 днів вона лежить у кошику Kobo: якщо це помилка, одразу "
-          f"напишіть адміністратору {ADMIN}. Копія (без фото): {path}.")
+    print(f"Форму «{asset.get('name')}» видалено. 7 днів вона лежить у кошику Kobo: якщо це помилка, "
+          f"одразу напишіть адміністраторові — {ADMIN}. Копія (без фото): {path}.")
     return 0
 
 
@@ -1190,22 +1204,27 @@ def cmd_api(args: argparse.Namespace) -> int:
     account(kobo)
     method = args.method.upper()
     path = urllib.parse.urlsplit(kobo.url(args.path)).path
-    if method != "GET":
-        if path.rstrip("/") == "/api/v2/assets":
-            raise KoboError("Нові форми створюйте командою create: вона питає організацію і ділиться формою.")
-        if "permission-assignments" in path and method == "DELETE":
-            raise KoboError("Доступи відкликайте командою unshare-user: вона не дасть прибрати головний акаунт.")
-        if not (args.backup or args.no_backup):
-            raise KoboError("Запит змінює Kobo, тож спершу потрібна копія: додайте --backup <uid форми>, "
-                            "або --no-backup \"причина\", якщо він не змінює жодної наявної форми чи відповідей.")
-        if args.backup:
-            print(f"Копію зроблено: {make_backup(kobo, args.backup, f'перед запитом {method} {path}')}")
     body = None
     if args.data:
         try:
             body = json.loads(sys.stdin.read() if args.data == "-" else Path(args.data).read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
             raise KoboError(f"Не вдалося прочитати тіло запиту {args.data}: {e}") from None
+    if method != "GET":
+        if path.rstrip("/") == "/api/v2/assets":
+            raise KoboError("Нові форми створюйте командою create: вона питає організацію і ділиться формою.")
+        form = re.fullmatch(r"/api/v2/assets/(\w+)/(.*)", path)
+        if form:
+            uid, rest = form.groups()
+            if method == "DELETE" and (rest == "" or rest.startswith("data/")):
+                raise KoboError("Видаляйте командами delete-form і delete-submissions: вони спершу показують, "
+                                "що зникне, і роблять копію.")
+            if method == "DELETE" and rest.startswith("permission-assignments"):
+                raise KoboError("Доступи відкликайте командою unshare-user: вона не дасть прибрати головний акаунт.")
+            if isinstance(body, dict) and "content" in body:
+                raise KoboError("Форму змінюйте командою update-form: вона перевіряє, чи не зачепить зміна "
+                                "питань, на які вже є відповіді.")
+            print(f"Копію зроблено: {make_backup(kobo, uid, f'перед запитом {method} {path}')}")
     result = kobo.request(method, args.path, body, raw=bool(args.out))
     if args.out:
         Path(args.out).write_bytes(result)
@@ -1302,14 +1321,11 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("uid")
     s.add_argument("--yes", action="store_true", help="лише після явного «так» працівника")
     s.set_defaults(func=cmd_delete_form)
-    s = sub.add_parser("api", help="будь-який запит до API Kobo (зміни лише з копією)")
+    s = sub.add_parser("api", help="будь-який запит до API Kobo (зміна форми — з автоматичною копією)")
     s.add_argument("method", choices=["GET", "POST", "PATCH", "PUT", "DELETE", "get", "post", "patch", "put", "delete"])
     s.add_argument("path", help="напр. /api/v2/assets/<uid>/")
     s.add_argument("--data", help="файл з JSON-тілом або - для stdin")
     s.add_argument("--out", help="зберегти відповідь у файл (для файлів і завантажень)")
-    guard = s.add_mutually_exclusive_group()
-    guard.add_argument("--backup", metavar="UID", help="спершу зробити копію цієї форми")
-    guard.add_argument("--no-backup", metavar="ПРИЧИНА", help="запит не змінює наявних форм чи відповідей")
     s.set_defaults(func=cmd_api)
     return p
 
@@ -1326,6 +1342,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception:  # never show an employee a traceback; keep it for the administrator
+        log = home() / "last-error.txt"
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            pass
+        print(f"Сталася несподівана помилка, дію не завершено. Подробиці записано у файл {log}. "
+              f"Зверніться до адміністратора: {ADMIN}.", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

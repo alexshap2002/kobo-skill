@@ -6,7 +6,7 @@ import unittest
 import zipfile
 
 from fake_kobo import FULL, submission
-from helpers import KoboTestCase
+from helpers import KoboTestCase, kobo
 
 
 class DataTest(KoboTestCase):
@@ -105,14 +105,10 @@ class DataTest(KoboTestCase):
         self.assertEqual(len(self.backup_dirs("aForm")), 1)
         self.assertIn("7 днів", text)
 
-    def test_api_write_requires_backup_choice(self):
+    def test_api_write_copies_the_form_first(self):
         body = self.tmp / "body.json"
         body.write_text(json.dumps({"name": "Нова назва"}), encoding="utf-8")
         code, text, err = self.run_cli("api", "PATCH", "/api/v2/assets/aForm/", "--data", str(body))
-        self.assertEqual(code, 2)
-        self.assertEqual(self.fake.calls("PATCH"), [])
-        code, text, err = self.run_cli("api", "PATCH", "/api/v2/assets/aForm/", "--data", str(body),
-                                       "--backup", "aForm")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.fake.assets["aForm"]["name"], "Нова назва")
         self.assertEqual(len(self.backup_dirs("aForm")), 1)
@@ -121,17 +117,28 @@ class DataTest(KoboTestCase):
 
     def test_api_guards_the_rules(self):
         body = self.tmp / "body.json"
-        body.write_text("{}", encoding="utf-8")
-        code, text, err = self.run_cli("api", "POST", "/api/v2/assets/", "--data", str(body), "--no-backup", "test")
-        self.assertEqual(code, 2, "new forms go through create, which asks for the organisation")
-        code, text, err = self.run_cli("api", "DELETE", "/api/v2/assets/aForm/permission-assignments/x/",
-                                       "--no-backup", "test")
-        self.assertEqual(code, 2)
-        code, text, err = self.run_cli("api", "GET", "https://evil.example.org/api/v2/assets/")
-        self.assertEqual(code, 2)
-        self.assertEqual(self.fake.calls("POST"), [])
-        self.assertEqual(self.fake.calls("DELETE"), [])
+        body.write_text(json.dumps({"content": {"survey": []}}), encoding="utf-8")
+        refused = [
+            ("POST", "/api/v2/assets/", ["--data", str(body)]),  # new forms: create asks for the organisation
+            ("DELETE", "/api/v2/assets/aForm/", []),  # delete-form previews and copies
+            ("DELETE", "/api/v2/assets/aForm/data/1/", []),  # delete-submissions previews and copies
+            ("PATCH", "/api/v2/assets/aForm/", ["--data", str(body)]),  # update-form checks answered questions
+            ("DELETE", "/api/v2/assets/aForm/permission-assignments/x/", []),  # unshare-user keeps main accounts
+            ("GET", "https://evil.example.org/api/v2/assets/", []),
+        ]
+        for method, path, extra in refused:
+            code, text, err = self.run_cli("api", method, path, *extra)
+            self.assertEqual(code, 2, (method, path))
+        self.assertEqual([c for c in self.fake.log if c[0] != "GET"], [])
+        self.assertIn("aForm", self.fake.assets)
 
+    def test_counts_read_as_natural_ukrainian(self):
+        self.assertEqual([kobo.answers_n(n) for n in (1, 2, 5, 11, 21, 22, 25, 112)],
+                         ["1 відповідь", "2 відповіді", "5 відповідей", "11 відповідей", "21 відповідь",
+                          "22 відповіді", "25 відповідей", "112 відповідей"])
+        code, text, err = self.run_cli("delete-submissions", "aForm", "--ids", "1,2", "--yes")
+        self.assertIn("Видалено 2 відповіді", text)
+        self.assertNotIn("адміністратору Олександр", text + err)
 
 if __name__ == "__main__":
     unittest.main()

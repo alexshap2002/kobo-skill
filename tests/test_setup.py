@@ -69,5 +69,26 @@ class SetupTest(KoboTestCase):
         self.assertNotIn("Traceback", out + err)
         self.assertEqual(len(self.fake.calls("GET", "/me/")), 4, "one try and three retries")
 
+    def test_writes_are_never_retried(self):
+        self.login()
+        self.fake.add_form("aForm", "Анкета")
+        self.fake.fail[("POST", "/api/v2/assets/")] = [502, 502, 502]
+        code, out, err = self.run_cli("create", "--clone-from", "aForm", "--name", "Копія", "--org", "ye-dobro")
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self.fake.calls("POST", "/api/v2/assets/")), 1,
+                         "Kobo may have created the form before the 502: a retry would make a duplicate")
+
+    def test_unexpected_failure_is_plain_and_logged(self):
+        self.login()
+        self.fake.add_form("aForm", "Анкета")
+        blocker = self.tmp / "not-a-folder"
+        blocker.write_text("x")
+        os.environ["KOBO_BACKUP_DIR"] = str(blocker)
+        code, out, err = self.run_cli("backup", "aForm")
+        self.assertEqual(code, 2)
+        self.assertNotIn("Traceback", out + err)
+        self.assertIn("адміністратора", err)
+        self.assertIn("Traceback", (self.home / "last-error.txt").read_text(encoding="utf-8"))
+
 if __name__ == "__main__":
     unittest.main()
