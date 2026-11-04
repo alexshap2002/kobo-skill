@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import uuid
 import urllib.parse
 import urllib.request
 import zipfile
@@ -541,7 +542,7 @@ def fetch_answers(kobo: Kobo, uid: str) -> list[dict]:
     return list(kobo.pages(f"/api/v2/assets/{uid}/data/", {"limit": 1000}))
 
 
-def make_backup(kobo: Kobo, uid: str, reason: str) -> Path:
+def make_backup(kobo: Kobo, uid: str, reason: str, answers: list[dict] | None = None) -> Path:
     """Copy one form (description, versions, all answers; never photos) and keep the newest copies."""
     asset = kobo.get(f"/api/v2/assets/{uid}/")
     previous = copies(uid)
@@ -557,7 +558,7 @@ def make_backup(kobo: Kobo, uid: str, reason: str) -> Path:
             known[v["uid"]] = {"uid": v["uid"], "date_deployed": v["date_deployed"],
                                "content": kobo.get(f"/api/v2/assets/{uid}/versions/{v['uid']}/").get("content")}
         versions.append(known[v["uid"]])
-    answers = fetch_answers(kobo, uid)
+    answers = fetch_answers(kobo, uid) if answers is None else answers
     note = ""
     xls = None
     try:
@@ -619,6 +620,169 @@ def find_copy(uid: str, which: str) -> Path:
     if not (path / "asset.json").is_file():
         raise KoboError(f"Копії {which} не знайдено. Подивіться список: kobo backups {uid}.")
     return path
+
+
+# --- form content --------------------------------------------------------------------------------------
+
+TRANSLATABLE = ("label", "hint", "guidance_hint", "constraint_message", "required_message")
+XML_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9._-]*\Z")
+GROUPS = {"begin_group": "end_group", "begin_repeat": "end_repeat"}
+RISK_TEXT = (
+    "Старі відповіді на ці питання з Kobo не зникнуть, але відірвуться від форми: у звітах і Google Таблиці "
+    "вони опиняться в окремій колонці або перестануть показуватися, а зміна типу може зіпсувати аналіз. "
+    "Краще додати нове питання, а старе лишити (можна приховати умовою relevant). Якщо працівник усе одно "
+    "хоче так зробити, поясніть йому наслідок простими словами і після його «так» повторіть з --force."
+)
+
+
+def load_content(path: str) -> dict:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise KoboError(f"Не вдалося прочитати опис форми {path}: {e}") from None
+    if isinstance(data, dict) and "survey" not in data and isinstance(data.get("content"), dict):
+        data = data["content"]  # an asset.json from a copy works too
+    if not isinstance(data, dict) or not isinstance(data.get("survey"), list):
+        raise KoboError(f"У файлі {path} немає списку питань survey.")
+    return data
+
+
+def normalize(content: dict) -> dict:
+    """Accept XLSForm-style rows ("select_one list", "begin group", plain-text labels) and store kpi's shape."""
+    content.setdefault("choices", [])
+    content.setdefault("settings", {})
+    content.setdefault("translations", [None])
+    slots = len(content["translations"]) or 1
+    translated = set(content.get("translated") or [])
+    for row in content["survey"] + content["choices"]:
+        parts = str(row.get("type", "")).split()
+        if len(parts) == 2 and parts[0] in ("begin", "end"):
+            row["type"] = "_".join(parts)
+        elif len(parts) == 2 and parts[0] in ("select_one", "select_multiple"):
+            row["type"], row["select_from_list_name"] = parts
+        for col in TRANSLATABLE:
+            if isinstance(row.get(col), str):
+                row[col] = [row[col]] * slots
+            if isinstance(row.get(col), list):
+                translated.add(col)
+    content["translated"] = sorted(translated)
+    return content
+
+
+def questions(content: dict) -> dict[str, tuple[str, str]]:
+    """xpath (as in the answers) -> (type, label)."""
+    out, stack = {}, []
+    for row in content.get("survey") or []:
+        kind = str(row.get("type", "")).split(" ")[0]
+        name = row.get("name") or row.get("$autoname") or ""
+        if kind in GROUPS:
+            stack.append(name)
+        elif kind in GROUPS.values():
+            if stack:
+                stack.pop()
+        elif name:
+            out["/".join([*filter(None, stack), name])] = (kind, _label(row) or name)
+    return out
+
+
+def validate(content: dict) -> list[str]:
+    problems = []
+    lists = {c.get("list_name") for c in content.get("choices") or []}
+    seen, stack = set(), []
+    for i, row in enumerate(content["survey"], 1):
+        kind = str(row.get("type", ""))
+        name = row.get("name") or row.get("$autoname") or ""
+        if not kind:
+            problems.append(f"рядок {i}: не вказано тип питання")
+            continue
+        if kind in GROUPS.values():
+            if not stack or GROUPS[stack.pop()] != kind:
+                problems.append(f"рядок {i}: {kind} без відповідного begin")
+            continue
+        path = "/".join([*stack, name])
+        if kind in GROUPS:
+            stack.append(kind)
+        if name and not XML_NAME.match(name):
+            problems.append(f"«{name}»: технічна назва (name) — лише латиниця, цифри, _ - . і не з цифри")
+        if name and path in seen:
+            problems.append(f"«{name}»: така технічна назва (name) вже є")
+        seen.add(path)
+        if kind in ("select_one", "select_multiple") and row.get("select_from_list_name") not in lists:
+            problems.append(f"«{name}»: у choices немає списку варіантів «{row.get('select_from_list_name')}»")
+    for kind in stack:
+        problems.append(f"групу чи повторення не закрито (бракує {GROUPS[kind]})")
+    return problems
+
+
+def checked_content(path: str) -> dict:
+    content = normalize(load_content(path))
+    problems = validate(content)
+    if problems:
+        raise KoboError("Форму не збережено, бо в ній є помилки:\n• " + "\n• ".join(problems))
+    return content
+
+
+def answered(records: list[dict]) -> set[str]:
+    out: set[str] = set()
+
+    def walk(record: dict) -> None:
+        for key, value in record.items():
+            if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+                for item in value:
+                    walk(item)
+            elif value not in (None, "", [], {}):
+                out.add(key)
+
+    for record in records:
+        walk(record)
+    return out
+
+
+def risky_changes(old: dict, new: dict, records: list[dict]) -> list[str]:
+    before, after, used = questions(old), questions(new), answered(records)
+    risks = []
+    for path, (kind, label) in before.items():
+        if path not in used:
+            continue
+        if path not in after:
+            risks.append(f"«{label}» ({path}) — прибрано або перейменовано, а відповіді на нього вже є")
+        elif after[path][0] != kind:
+            risks.append(f"«{label}» ({path}) — тип змінено з {kind} на {after[path][0]}, а відповіді вже є")
+    return risks
+
+
+def live_content(kobo: Kobo, asset: dict) -> dict:
+    """What people fill in now: the deployed version, or the draft if never deployed."""
+    vid = asset.get("deployed_version_id")
+    if vid:
+        return kobo.get(f"/api/v2/assets/{asset['uid']}/versions/{vid}/").get("content") or {}
+    return asset.get("content") or {}
+
+
+def import_xlsx(kobo: Kobo, path: Path) -> str:
+    try:
+        blob = path.read_bytes()
+    except OSError as e:
+        raise KoboError(f"Не вдалося прочитати файл {path}: {e}") from None
+    boundary = uuid.uuid4().hex
+    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="library"\r\n\r\nfalse\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="form.xlsx"\r\n'
+            "Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n").encode()
+    body += blob + f"\r\n--{boundary}--\r\n".encode()
+    task = kobo.post("/api/v2/imports/", data=body, content_type=f"multipart/form-data; boundary={boundary}")
+    for _ in range(90):
+        state = kobo.get(f"/api/v2/imports/{task['uid']}/")
+        if state.get("status") == "complete":
+            messages = state.get("messages") or {}
+            made = (messages.get("created") or messages.get("updated") or [{}])[0].get("uid")
+            if made:
+                return made
+            break
+        if state.get("status") == "error":
+            raise KoboError("Kobo не зміг прочитати файл форми: "
+                            + _kobo_says(json.dumps(state.get("messages"), ensure_ascii=False).encode()))
+        time.sleep(2)
+    raise KoboError("Kobo не підтвердив імпорт файлу форми. Перевірте за кілька хвилин: kobo forms.")
 
 
 # --- commands ----------------------------------------------------------------------------------------
@@ -772,6 +936,90 @@ def cmd_restore_form(args: argparse.Namespace) -> int:
     return 0
 
 
+NOT_DEPLOYED = (" Форма ще не розгорнута (Deploy): збирати відповіді не можна, і Google Таблиця організації "
+                "з'явиться лише після розгортання — kobo deploy {uid}.")
+
+
+def sharing_warning(asset: dict) -> str:
+    if not needs_sharing({"sharing": sharing(asset)}):
+        return ""
+    return ("\nУвага: форма ще не поділена з організацією як слід, тож її не буде ні в архіві, ні в таблиці. "
+            "Запитайте працівника, для якої організації вона, і виконайте share.")
+
+
+def cmd_create(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    if args.clone_from:
+        uid = kobo.post("/api/v2/assets/", {"clone_from": args.clone_from, "name": args.name,
+                                            "asset_type": "survey"})["uid"]
+    elif args.xlsx:
+        uid = import_xlsx(kobo, Path(args.xlsx))
+        kobo.patch(f"/api/v2/assets/{uid}/", {"name": args.name})
+    else:
+        content = checked_content(args.content)
+        uid = kobo.post("/api/v2/assets/", {"name": args.name, "asset_type": "survey", "content": content})["uid"]
+    try:
+        names = share_with_orgs(kobo, uid, args.org)
+    except KoboError as e:
+        raise KoboError(f"Форму «{args.name}» ({uid}) створено, але поділитися нею не вдалося: {e} "
+                        f"Повторіть: kobo share {uid} --org {args.org}") from None
+    text = f"Створено форму «{args.name}» — {uid}. Її поділено з {names} з повними правами."
+    if args.deploy:
+        deploy(kobo, uid)
+        text += " Форму розгорнуто: можна збирати відповіді, Google Таблиця з'явиться за кілька хвилин."
+    else:
+        text += NOT_DEPLOYED.format(uid=uid)
+    print(text)
+    return 0
+
+
+def cmd_update_form(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    new = checked_content(args.content)
+    asset = kobo.get(f"/api/v2/assets/{args.uid}/")
+    records = fetch_answers(kobo, args.uid)
+    risks = risky_changes(live_content(kobo, asset), new, records)
+    if risks and not args.force:
+        raise KoboError("Зміну не зроблено, бо вона зачіпає питання, на які вже є відповіді:\n• "
+                        + "\n• ".join(risks) + "\n" + RISK_TEXT)
+    path = make_backup(kobo, args.uid, "перед зміною форми", answers=records)
+    kobo.patch(f"/api/v2/assets/{args.uid}/", {"content": new})
+    text = f"Форму {args.uid} змінено. Копія до зміни: {path}."
+    if args.deploy:
+        deploy(kobo, args.uid)
+        text += " Нову версію розгорнуто: збирачі отримають її після оновлення форми в застосунку."
+    else:
+        text += (" Зміни ще не розгорнуті: люди заповнюють стару версію, доки форму не розгорнуть "
+                 f"(kobo deploy {args.uid}).")
+    print(text + sharing_warning(asset))
+    return 0
+
+
+def cmd_deploy(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    path = make_backup(kobo, args.uid, "перед розгортанням")
+    deploy(kobo, args.uid)
+    asset = kobo.get(f"/api/v2/assets/{args.uid}/")
+    print(f"Форму «{asset.get('name')}» розгорнуто: можна збирати відповіді, Google Таблиця організації "
+          f"оновиться за кілька хвилин. Копія перед розгортанням: {path}." + sharing_warning(asset))
+    return 0
+
+
+def cmd_archive(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    active = args.command == "unarchive"
+    path = make_backup(kobo, args.uid, "перед " + ("поверненням з архіву" if active else "архівуванням"))
+    kobo.patch(f"/api/v2/assets/{args.uid}/deployment/", {"active": active})
+    print(f"Форму {args.uid} " + ("знову відкрито для відповідей." if active else
+                                   "архівовано: нові відповіді не приймаються, наявні лишаються.")
+          + f" Копія: {path}.")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kobo", description="Робота з KoboToolbox (eu.kobotoolbox.org) за правилами організації.")
     sub = p.add_subparsers(dest="command", required=True)
@@ -808,6 +1056,28 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("uid")
     s.add_argument("--backup", required=True, help="latest, назва копії (дата-час) або шлях до неї")
     s.set_defaults(func=cmd_restore_form)
+    s = sub.add_parser("create", help="створити форму й поділитися нею з організацією")
+    s.add_argument("--name", required=True)
+    source = s.add_mutually_exclusive_group(required=True)
+    source.add_argument("--content", help="JSON з survey/choices (kpi або XLSForm-стиль)")
+    source.add_argument("--xlsx", help="файл XLSForm")
+    source.add_argument("--clone-from", help="uid форми, яку скопіювати")
+    s.add_argument("--org", required=True, choices=[*ORGS, "both"])
+    s.add_argument("--deploy", action="store_true")
+    s.set_defaults(func=cmd_create)
+    s = sub.add_parser("update-form", help="змінити форму (спершу копія і перевірка безпеки)")
+    s.add_argument("uid")
+    s.add_argument("--content", required=True)
+    s.add_argument("--deploy", action="store_true")
+    s.add_argument("--force", action="store_true", help="лише після явного «так» працівника")
+    s.set_defaults(func=cmd_update_form)
+    s = sub.add_parser("deploy", help="розгорнути форму (спершу копія)")
+    s.add_argument("uid")
+    s.set_defaults(func=cmd_deploy)
+    for name, text in (("archive", "архівувати форму"), ("unarchive", "повернути форму з архіву")):
+        s = sub.add_parser(name, help=text)
+        s.add_argument("uid")
+        s.set_defaults(func=cmd_archive)
     return p
 
 
