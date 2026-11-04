@@ -9,6 +9,7 @@ Python 3.9+ standard library only (Mac and Windows).
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -509,8 +510,12 @@ def answer_tables(records: list[dict], content: dict) -> list[tuple[str, list[li
 STAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(-\d+)?")
 
 
+def clean_filename(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name).strip(" .")
+
+
 def safe_name(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name).strip(" .")[:60].strip(" .") or "форма"
+    return clean_filename(name)[:60].strip(" .") or "форма"
 
 
 def copies(uid: str) -> list[Path]:
@@ -669,19 +674,20 @@ def normalize(content: dict) -> dict:
     return content
 
 
-def questions(content: dict) -> dict[str, tuple[str, str]]:
-    """xpath (as in the answers) -> (type, label)."""
+def questions(content: dict) -> dict[str, tuple[str, str, bool]]:
+    """xpath (as in the answers) -> (type, label, inside a repeat)."""
     out, stack = {}, []
     for row in content.get("survey") or []:
         kind = str(row.get("type", "")).split(" ")[0]
         name = row.get("name") or row.get("$autoname") or ""
         if kind in GROUPS:
-            stack.append(name)
+            stack.append((name, kind == "begin_repeat"))
         elif kind in GROUPS.values():
             if stack:
                 stack.pop()
         elif name:
-            out["/".join([*filter(None, stack), name])] = (kind, _label(row) or name)
+            path = "/".join([*filter(None, (n for n, _ in stack)), name])
+            out[path] = (kind, _label(row) or name, any(r for _, r in stack))
     return out
 
 
@@ -741,7 +747,7 @@ def answered(records: list[dict]) -> set[str]:
 def risky_changes(old: dict, new: dict, records: list[dict]) -> list[str]:
     before, after, used = questions(old), questions(new), answered(records)
     risks = []
-    for path, (kind, label) in before.items():
+    for path, (kind, label, _) in before.items():
         if path not in used:
             continue
         if path not in after:
@@ -783,6 +789,35 @@ def import_xlsx(kobo: Kobo, path: Path) -> str:
                             + _kobo_says(json.dumps(state.get("messages"), ensure_ascii=False).encode()))
         time.sleep(2)
     raise KoboError("Kobo не підтвердив імпорт файлу форми. Перевірте за кілька хвилин: kobo forms.")
+
+
+# --- answers ---------------------------------------------------------------------------------------------
+
+STATUSES = {"approved": "validation_status_approved", "not_approved": "validation_status_not_approved",
+            "on_hold": "validation_status_on_hold"}
+
+
+def parse_ids(text: str) -> list[int]:
+    ids: list[int] = []
+    for part in text.replace(" ", "").split(","):
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise KoboError(f"Не розумію номери записів «{text}». Приклад: 12,15,20-25.")
+        start, end = int(m.group(1)), int(m.group(2) or m.group(1))
+        ids += range(start, end + 1)
+    return sorted(set(ids))
+
+
+def pick(records: list[dict], ids: list[int]) -> list[dict]:
+    chosen = [r for r in records if r.get("_id") in ids]
+    missing = sorted(set(ids) - {r.get("_id") for r in chosen})
+    if missing:
+        raise KoboError(f"У формі немає записів з ID {', '.join(map(str, missing))}. Нічого не змінено.")
+    return chosen
+
+
+def with_files(records: list[dict]) -> int:
+    return sum(1 for r in records if r.get("_attachments"))
 
 
 # --- commands ----------------------------------------------------------------------------------------
@@ -1020,6 +1055,162 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    asset = kobo.get(f"/api/v2/assets/{args.uid}/")
+    records = fetch_answers(kobo, args.uid)
+    out = Path(args.out) if args.out else Path.cwd() / (
+        f"{safe_name(asset.get('name') or args.uid)}_{time.strftime('%Y-%m-%d')}.{args.format}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if args.format == "json":
+        out.write_text(json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8")
+        written = [out]
+    else:
+        tables = answer_tables(records, live_content(kobo, asset))
+        if args.format == "xlsx":
+            write_xlsx(out, tables)
+            written = [out]
+        else:
+            written = []
+            for i, (title, rows) in enumerate(tables):
+                path = out if i == 0 else out.with_name(f"{out.stem}__{clean_filename(title)}.csv")
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    csv.writer(f).writerows(rows)
+                written.append(path)
+    print(f"Вивантажено {len(records)} відповідей: " + ", ".join(str(p) for p in written))
+    return 0
+
+
+def cmd_attachments(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    records = fetch_answers(kobo, args.uid)
+    if args.ids:
+        records = pick(records, parse_ids(args.ids))
+    out, count = Path(args.out), 0
+    for record in records:
+        for att in record.get("_attachments") or []:
+            url = att.get("download_url") or att.get("download_large_url")
+            if not url:
+                continue
+            target = out / str(record.get("_id")) / (clean_filename(Path(str(att.get("filename") or "")).name)
+                                                     or f"file-{count + 1}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(kobo.get(url, raw=True))
+            count += 1
+    print(f"Завантажено файлів: {count} у {out}")
+    return 0
+
+
+def cmd_set_values(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    asset = kobo.get(f"/api/v2/assets/{args.uid}/")
+    known = questions(live_content(kobo, asset))
+    data = {}
+    for item in args.set:
+        field, sep, value = item.partition("=")
+        if not sep or field not in known:
+            raise KoboError(f"Питання «{field}» у формі немає. Технічні назви питань: {', '.join(known)}.")
+        if known[field][2]:
+            raise KoboError(f"«{field}» — питання в повторюваній групі; такі значення масово змінити не можна. "
+                            "Виправте їх у Kobo вручну (Data → відповідь → Edit).")
+        data[field] = value
+    records = fetch_answers(kobo, args.uid)
+    ids = [r["_id"] for r in pick(records, parse_ids(args.ids))]
+    path = make_backup(kobo, args.uid, f"перед зміною значень у записах {args.ids}", answers=records)
+    kobo.patch(f"/api/v2/assets/{args.uid}/data/bulk/", {"payload": {"submission_ids": ids, "data": data}})
+    print(f"Змінено {len(ids)} відповідей. Копія до зміни: {path}.")
+    return 0
+
+
+def cmd_set_status(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    records = fetch_answers(kobo, args.uid)
+    ids = [r["_id"] for r in pick(records, parse_ids(args.ids))]
+    path = make_backup(kobo, args.uid, f"перед зміною статусу записів {args.ids}", answers=records)
+    kobo.patch(f"/api/v2/assets/{args.uid}/data/validation_statuses/",
+               {"payload": {"submission_ids": ids, "validation_status.uid": STATUSES[args.status]}})
+    print(f"Статус «{args.status}» поставлено {len(ids)} відповідям. Копія до зміни: {path}.")
+    return 0
+
+
+def cmd_delete_submissions(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    asset = kobo.get(f"/api/v2/assets/{args.uid}/")
+    records = fetch_answers(kobo, args.uid)
+    doomed = pick(records, parse_ids(args.ids))
+    files = with_files(doomed)
+    if not args.yes:
+        print(f"Буде видалено {len(doomed)} відповідей з форми «{asset.get('name')}» ({args.uid}): ID "
+              + ", ".join(str(r["_id"]) for r in doomed) + "."
+              + (f" {files} з них мають фото чи файли: після видалення їх не повернути, бо фото не входять "
+                 "ні в локальну копію, ні в центральний архів." if files else "")
+              + " Kobo видалених відповідей не повертає; локальна копія буде зроблена перед видаленням, "
+              "а центральний архів має нічну копію (без фото). Покажіть це працівнику і, якщо він скаже "
+              "«так», повторіть команду з --yes.")
+        return 1
+    path = make_backup(kobo, args.uid, f"перед видаленням записів {args.ids}", answers=records)
+    for record in doomed:
+        kobo.delete(f"/api/v2/assets/{args.uid}/data/{int(record['_id'])}/")
+    print(f"Видалено {len(doomed)} відповідей. Копія до видалення: {path}. Повернути їх може адміністратор "
+          f"{ADMIN} з копії чи центрального архіву" + (" (без фото)." if files else "."))
+    return 0
+
+
+def cmd_delete_form(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    asset = kobo.get(f"/api/v2/assets/{args.uid}/")
+    records = fetch_answers(kobo, args.uid)
+    files = with_files(records)
+    if not args.yes:
+        print(f"Буде видалено форму «{asset.get('name')}» ({args.uid}) разом з усіма {len(records)} відповідями"
+              + (f", з них {files} з фото чи файлами" if files else "") + ". Видалена форма 7 днів лежить у "
+              "кошику Kobo (повернути її разом із фото може адміністратор через підтримку Kobo), потім зникає "
+              "назавжди. Локальна копія буде зроблена перед видаленням (без фото). Покажіть це працівнику і, "
+              "якщо він скаже «так», повторіть команду з --yes.")
+        return 1
+    path = make_backup(kobo, args.uid, "перед видаленням форми", answers=records)
+    kobo.delete(f"/api/v2/assets/{args.uid}/")
+    print(f"Форму «{asset.get('name')}» видалено. 7 днів вона лежить у кошику Kobo: якщо це помилка, одразу "
+          f"напишіть адміністратору {ADMIN}. Копія (без фото): {path}.")
+    return 0
+
+
+def cmd_api(args: argparse.Namespace) -> int:
+    kobo = client()
+    account(kobo)
+    method = args.method.upper()
+    path = urllib.parse.urlsplit(kobo.url(args.path)).path
+    if method != "GET":
+        if path.rstrip("/") == "/api/v2/assets":
+            raise KoboError("Нові форми створюйте командою create: вона питає організацію і ділиться формою.")
+        if "permission-assignments" in path and method == "DELETE":
+            raise KoboError("Доступи відкликайте командою unshare-user: вона не дасть прибрати головний акаунт.")
+        if not (args.backup or args.no_backup):
+            raise KoboError("Запит змінює Kobo, тож спершу потрібна копія: додайте --backup <uid форми>, "
+                            "або --no-backup \"причина\", якщо він не змінює жодної наявної форми чи відповідей.")
+        if args.backup:
+            print(f"Копію зроблено: {make_backup(kobo, args.backup, f'перед запитом {method} {path}')}")
+    body = None
+    if args.data:
+        try:
+            body = json.loads(sys.stdin.read() if args.data == "-" else Path(args.data).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise KoboError(f"Не вдалося прочитати тіло запиту {args.data}: {e}") from None
+    result = kobo.request(method, args.path, body, raw=bool(args.out))
+    if args.out:
+        Path(args.out).write_bytes(result)
+        print(f"Збережено: {args.out}")
+    elif result is not None:
+        print(json.dumps(result, ensure_ascii=False, indent=1))
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kobo", description="Робота з KoboToolbox (eu.kobotoolbox.org) за правилами організації.")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1078,6 +1269,44 @@ def parser() -> argparse.ArgumentParser:
         s = sub.add_parser(name, help=text)
         s.add_argument("uid")
         s.set_defaults(func=cmd_archive)
+    s = sub.add_parser("export", help="вивантажити відповіді з людськими назвами (xlsx, csv або json)")
+    s.add_argument("uid")
+    s.add_argument("--format", choices=["xlsx", "csv", "json"], default="xlsx")
+    s.add_argument("--out")
+    s.set_defaults(func=cmd_export)
+    s = sub.add_parser("attachments", help="завантажити фото й файли відповідей")
+    s.add_argument("uid")
+    s.add_argument("--out", required=True)
+    s.add_argument("--ids", help="лише ці записи, напр. 12,15,20-25")
+    s.set_defaults(func=cmd_attachments)
+    s = sub.add_parser("set-values", help="змінити значення у відповідях (спершу копія)")
+    s.add_argument("uid")
+    s.add_argument("--ids", required=True)
+    s.add_argument("--set", action="append", required=True, metavar="ПИТАННЯ=ЗНАЧЕННЯ")
+    s.set_defaults(func=cmd_set_values)
+    s = sub.add_parser("set-status", help="статус перевірки відповідей (спершу копія)")
+    s.add_argument("uid")
+    s.add_argument("--ids", required=True)
+    s.add_argument("--status", required=True, choices=list(STATUSES))
+    s.set_defaults(func=cmd_set_status)
+    s = sub.add_parser("delete-submissions", help="видалити відповіді: без --yes лише показує, що зникне")
+    s.add_argument("uid")
+    s.add_argument("--ids", required=True)
+    s.add_argument("--yes", action="store_true", help="лише після явного «так» працівника")
+    s.set_defaults(func=cmd_delete_submissions)
+    s = sub.add_parser("delete-form", help="видалити форму: без --yes лише показує, що зникне")
+    s.add_argument("uid")
+    s.add_argument("--yes", action="store_true", help="лише після явного «так» працівника")
+    s.set_defaults(func=cmd_delete_form)
+    s = sub.add_parser("api", help="будь-який запит до API Kobo (зміни лише з копією)")
+    s.add_argument("method", choices=["GET", "POST", "PATCH", "PUT", "DELETE", "get", "post", "patch", "put", "delete"])
+    s.add_argument("path", help="напр. /api/v2/assets/<uid>/")
+    s.add_argument("--data", help="файл з JSON-тілом або - для stdin")
+    s.add_argument("--out", help="зберегти відповідь у файл (для файлів і завантажень)")
+    guard = s.add_mutually_exclusive_group()
+    guard.add_argument("--backup", metavar="UID", help="спершу зробити копію цієї форми")
+    guard.add_argument("--no-backup", metavar="ПРИЧИНА", help="запит не змінює наявних форм чи відповідей")
+    s.set_defaults(func=cmd_api)
     return p
 
 
