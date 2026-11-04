@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "kobo-skill",
+  "description": "Робота з KoboToolbox для працівників «Будь вільний» і «Є добро»",
+  "owner": {
+    "name": "Олександр Шаповалов",
+    "url": "https://github.com/alexshap2002"
+  },
+  "plugins": [
+    {
+      "name": "kobo",
+      "description": "Форми, відповіді й звіти KoboToolbox (eu.kobotoolbox.org) звичайною мовою — з копією перед кожною зміною і поширенням кожної форми на організацію.",
+      "source": "./plugins/kobo",
+      "category": "productivity"
+    }
+  ]
+}
