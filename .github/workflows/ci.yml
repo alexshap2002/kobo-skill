@@ -12,13 +12,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the floor (the Python that ships with Mac command line tools); hosted runners
-        # still offer it only on Windows, so the Mac floor is checked on a real Mac before each release.
+        # 3.9 is the floor (the Python that ships with Mac command line tools). Hosted runners offer it
+        # only on Windows, and this account gets no macOS runners, so Mac (3.9 and 3.12) is tested
+        # locally before each push: python3 -m unittest discover -s tests
         include:
           - {os: windows-latest, python: "3.9"}
           - {os: windows-latest, python: "3.12"}
           - {os: ubuntu-latest, python: "3.12"}
-          - {os: macos-latest, python: "3.12"}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     env:
