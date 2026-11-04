@@ -72,7 +72,7 @@ def save_token(token: str) -> None:
 
 def load_token() -> str:
     try:
-        token = (home() / "token").read_text().strip()
+        token = (home() / "token").read_text(encoding="utf-8").strip()
     except OSError:
         token = ""
     if not token:
@@ -86,7 +86,7 @@ def load_token() -> str:
 
 def load_state() -> dict:
     try:
-        state = json.loads((home() / "state.json").read_text())
+        state = json.loads((home() / "state.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return state if isinstance(state, dict) else {}
@@ -1311,6 +1311,9 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):  # Windows consoles and pipes default to a legacy code page
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args(argv)
     try:
         return args.func(args)

@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests (fake Kobo)
+        shell: bash
+        run: python -m unittest discover -s tests -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts
+        run: shellcheck plugins/kobo/skills/kobo/scripts/kobo plugins/kobo/hooks/session-start
+      - name: Manifests are valid JSON
+        run: for f in .claude-plugin/marketplace.json plugins/kobo/.claude-plugin/plugin.json plugins/kobo/hooks/hooks.json; do python3 -m json.tool "$f" >/dev/null || exit 1; done
