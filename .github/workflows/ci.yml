@@ -12,9 +12,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.9", "3.12"]
+        # 3.9 is the floor (the Python that ships with Mac command line tools); hosted runners
+        # still offer it only on Windows, so the Mac floor is checked on a real Mac before each release.
+        include:
+          - {os: windows-latest, python: "3.9"}
+          - {os: windows-latest, python: "3.12"}
+          - {os: ubuntu-latest, python: "3.12"}
+          - {os: macos-latest, python: "3.12"}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     env:
       PYTHONUTF8: "1"
     steps:
