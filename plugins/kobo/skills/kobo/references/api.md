@@ -26,7 +26,10 @@ window.kobo = (() => {
       'change_submissions', 'delete_submissions', 'validate_submissions'],
   };
   let key = null;
+  let me = null;
   const last = (url) => url.replace(/\/$/, '').split('/').pop();
+  const has = (asset, user) => new Set((asset.permissions || [])
+    .filter((p) => last(p.user) === user).map((p) => last(p.permission)));
 
   // Kobo request with the employee's key: {status, data}. status 0 means it was never sent.
   async function kobo(method, path, body) {
@@ -52,12 +55,15 @@ window.kobo = (() => {
 
   kobo.connect = async (k) => {
     key = String(k).trim();
-    const me = await kobo('GET', '/me/');
-    if (me.status === 200 && !MAIN.includes(me.data.username)) return {ok: true, username: me.data.username};
+    const who = await kobo('GET', '/me/');
+    if (who.status === 200 && !MAIN.includes(who.data.username)) {
+      me = who.data.username;
+      return {ok: true, username: me};
+    }
     key = null;
-    if (me.status === 200) return {ok: false, why: 'головний акаунт організації'};
-    if (me.status === 401 || me.status === 403) return {ok: false, why: 'ключ не підійшов', status: me.status};
-    return {ok: false, why: 'Kobo не відповідає', status: me.status};
+    if (who.status === 200) return {ok: false, why: 'головний акаунт організації'};
+    if (who.status === 401 || who.status === 403) return {ok: false, why: 'ключ не підійшов', status: who.status};
+    return {ok: false, why: 'Kobo не відповідає', status: who.status};
   };
 
   kobo.all = async (path) => {
@@ -77,8 +83,7 @@ window.kobo = (() => {
     const a = (await kobo('GET', asset)).data;
     const assignable = new Set((a.assignable_permissions || []).map((p) => last(p.url)));
     const wanted = ROLES[role].filter((p) => !assignable.size || assignable.has(p));
-    const has = (x) => new Set(x.permissions.filter((p) => last(p.user) === user).map((p) => last(p.permission)));
-    const before = has(a);
+    const before = has(a, user);
     for (const p of wanted.filter((p) => !before.has(p))) {
       // 400 can mean "already implied by another permission": the re-read below decides
       await kobo('POST', `${asset}permission-assignments/`, {
@@ -86,9 +91,27 @@ window.kobo = (() => {
         permission: `${location.origin}/api/v2/permissions/${p}/`,
       });
     }
-    const after = has((await kobo('GET', asset)).data);
+    const after = has((await kobo('GET', asset)).data, user);
     const missing = wanted.filter((p) => !after.has(p));
     return {ok: missing.length === 0, missing};
+  };
+
+  // The employee's own forms that no organisation fully has, or that one has only partly.
+  kobo.unshared = async () => {
+    const forms = await kobo.all('/api/v2/assets/?q=asset_type:survey&limit=300');
+    if (forms.status !== 200) return forms;
+    const out = [];
+    for (let a of forms.data.filter((f) => f.owner__username === me)) {
+      if (!a.permissions) a = (await kobo('GET', `/api/v2/assets/${a.uid}/`)).data;
+      const state = MAIN.map((user) => {
+        const got = has(a, user);
+        return ROLES.full.every((p) => got.has(p)) ? 'full' : got.size ? 'partial' : 'none';
+      });
+      if (!state.includes('full') || state.includes('partial')) {
+        out.push({uid: a.uid, name: a.name, kobo_ymbefree: state[0], kobo_edobro: state[1]});
+      }
+    }
+    return {status: 200, data: out};
   };
 
   // Deploys the current version: the first time POST, afterwards PATCH with that version.
@@ -143,12 +166,15 @@ return r.data.map((a) => ({uid: a.uid, name: a.name, owner: a.owner__username,
 Що люди заповнюють зараз (розгорнута версія): `/api/v2/assets/<uid>/versions/<deployed_version_id>/` →
 `content`.
 
-Чи поділена форма з організацією: у `permissions` є `kobo_ymbefree` або `kobo_edobro` з усіма правами
-`full`. Щоб доповнити: `kobo.share(uid, 'kobo_ymbefree')`.
+**Поширення на організацію.** Форма поділена, коли в `permissions` є `kobo_ymbefree` або `kobo_edobro` з
+усіма правами `full`.
+- Усі власні форми працівника, де цього бракує: `await kobo.unshared()`. Повертає `uid`, `name` і стан для
+  кожної організації: `full`, `partial` або `none`.
+- Поділитися або доповнити права: `kobo.share(uid, 'kobo_ymbefree')` чи `kobo.share(uid, 'kobo_edobro')`.
 
 ## 3. Створення форми
 
-Спершу запитай, для якої організації форма (SKILL.md, «Захист», п. 2).
+Спершу запитай, для якої організації форма (SKILL.md, «Кожна форма — в організації»).
 
 **З опису** (формат — у `forms.md`):
 ```
@@ -186,7 +212,7 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
 1. Візьми `content` з подробиць форми і внеси зміни.
 2. Якщо у формі вже є відповіді, з'ясуй, на які питання вони є. Це ключі записів (розділ 7), наприклад
    `household/hh_size`. Якщо зміна прибирає, перейменовує, переносить таке питання чи змінює його тип,
-   спершу поговори з працівником (SKILL.md, «Захист», п. 3).
+   спершу поговори з працівником (SKILL.md, «Захист», п. 2).
 3. Збережи: `kobo('PATCH', '/api/v2/assets/<uid>/', {content})`.
 4. Якщо форма розгорнута і зміни мають запрацювати одразу, виконай `kobo.deploy(uid)`.
 

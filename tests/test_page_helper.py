@@ -78,6 +78,23 @@ class PageHelperTest(unittest.TestCase):
         self.assertFalse(any("bulk" in path for _, path, _ in posts))
         self.assertEqual(self.fake.calls("DELETE"), [])
 
+    def test_unshared_lists_own_forms_without_full_org_access(self):
+        self.fake.add_form("aOk", "Поділена", shared={"kobo_edobro": FULL})
+        self.fake.add_form("aNone", "Нічия")
+        self.fake.add_form("aHalf", "Половинчаста", shared={"kobo_ymbefree": ["view_asset"]})
+        self.fake.add_form("aMixed", "Змішана", shared={"kobo_edobro": FULL, "kobo_ymbefree": ["view_asset"]})
+        self.fake.add_form("aForeign", "Чужа", owner="petro", shared={"olena": ["view_asset"]})
+        result = self.run_js(f"""
+            await kobo.connect({json.dumps(OLENA)});
+            return await kobo.unshared();""")
+        self.assertEqual(result["status"], 200)
+        self.assertEqual({f["uid"]: (f["kobo_ymbefree"], f["kobo_edobro"]) for f in result["data"]}, {
+            "aNone": ("none", "none"),
+            "aHalf": ("partial", "none"),
+            "aMixed": ("partial", "full"),
+        })
+        self.assertEqual({f["name"] for f in result["data"]}, {"Нічия", "Половинчаста", "Змішана"})
+
     def test_deploy_first_time_then_new_version(self):
         self.fake.add_form("aD", "Чернетка", deployed=False)
         self.run_js(f"""
