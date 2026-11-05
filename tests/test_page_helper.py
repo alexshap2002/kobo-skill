@@ -14,9 +14,23 @@ from fake_kobo import FULL, MAIN, OLENA, FakeKobo
 API_DOC = Path(__file__).resolve().parents[1] / "plugins/kobo/skills/kobo/references/api.md"
 
 
-def helper() -> str:
-    blocks = re.findall(r"```js\n(.*?)```", API_DOC.read_text(encoding="utf-8"), re.S)
-    return blocks[0]
+def blocks() -> list[str]:
+    return re.findall(r"```(?:js)?\n(.*?)```", API_DOC.read_text(encoding="utf-8"), re.S)
+
+
+def helper(site: str) -> str:
+    """The helper exactly as documented, pointed at a test server instead of eu.kobotoolbox.org."""
+    code = blocks()[0]
+    real = "const SITE = 'https://eu.kobotoolbox.org';"
+    assert real in code
+    return code.replace(real, f"const SITE = {json.dumps(site)};")
+
+
+def recipe(snippet: str) -> str:
+    """The one documented recipe that contains `snippet`."""
+    found = [b for b in blocks()[1:] if snippet in b]
+    assert len(found) == 1, snippet
+    return found[0]
 
 
 @unittest.skipUnless(shutil.which("node"), "needs Node to run the browser helper")
@@ -25,10 +39,11 @@ class PageHelperTest(unittest.TestCase):
         self.fake = FakeKobo()
         self.addCleanup(self.fake.close)
 
-    def run_js(self, body: str):
+    def run_js(self, body: str, page: str | None = None):
         """body runs in an async function after the helper; its return value comes back as JSON."""
-        script = (f"globalThis.window = globalThis;\nglobalThis.location = {{origin: {json.dumps(self.fake.url)}}};\n"
-                  f"{helper()}\n"
+        page = page or self.fake.url
+        script = (f"globalThis.window = globalThis;\nglobalThis.location = {{origin: {json.dumps(page)}}};\n"
+                  f"{helper(self.fake.url)}\n"
                   f"(async () => {{ {body} }})().then(r => console.log(JSON.stringify(r)));")
         done = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -87,7 +102,7 @@ class PageHelperTest(unittest.TestCase):
         dead = FakeKobo()
         dead.close()  # nothing listens on this port any more
         script = (f"globalThis.window = globalThis;\nglobalThis.location = {{origin: {json.dumps(dead.url)}}};\n"
-                  f"{helper()}\n(async () => {{ const c = await kobo.connect({json.dumps(OLENA)});"
+                  f"{helper(dead.url)}\n(async () => {{ const c = await kobo.connect({json.dumps(OLENA)});"
                   " return c; })().then(r => console.log(JSON.stringify(r)));")
         done = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -123,7 +138,24 @@ class PageHelperTest(unittest.TestCase):
         self.assertGreater(result["r"]["bytes"], 0)
         self.assertNotIn("saved", result["r"])
 
-    def test_import_then_wait_until_complete(self):
+    def test_key_stays_off_other_sites(self):
+        result = self.run_js(f"""
+            const sent = [];
+            const real = globalThis.fetch;
+            globalThis.fetch = (url, opts) => {{ sent.push(String(url)); return real(url, opts); }};
+            return {{c: await kobo.connect({json.dumps(OLENA)}), sent}};""", page="https://docs.google.com")
+        self.assertEqual(result["c"]["why"], "Kobo не відповідає")
+        self.assertEqual(result["sent"], [], "nothing leaves a page that is not Kobo")
+
+    def test_revert_recipe_does_not_report_a_missing_version_as_saved(self):
+        self.fake.add_form("aR", "Форма")
+        code = recipe("versions/<версія>/").replace("<uid>", "aR").replace("<версія>", "nope")
+        result = self.run_js(f"await kobo.connect({json.dumps(OLENA)});\n{code}")
+        self.assertEqual(result["status"], 404)
+        self.assertEqual(self.fake.calls("PATCH"), [])
+
+    def test_wait_polls_a_task_until_complete(self):
+        # the fake's import task stands in for an export task: both report their status the same way
         result = self.run_js(f"""
             await kobo.connect({json.dumps(OLENA)});
             const f = new FormData();
@@ -164,6 +196,15 @@ class PageHelperTest(unittest.TestCase):
         self.assertEqual(second[0], "PATCH")
         self.assertEqual(second[2]["version_id"], self.fake.assets["aD"]["deployed_version_id"])
         self.assertNotEqual(second[2]["version_id"], "v1")
+
+    def test_deploying_an_archived_form_keeps_it_archived(self):
+        self.fake.add_form("aA", "Архівна")
+        self.fake.assets["aA"]["active"] = False
+        self.run_js(f"""
+            await kobo.connect({json.dumps(OLENA)});
+            return await kobo.deploy('aA');""")
+        (call,) = self.fake.calls("PATCH", "/deployment/")
+        self.assertIs(call[2]["active"], False)
 
 
 if __name__ == "__main__":

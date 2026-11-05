@@ -30,6 +30,7 @@
 
 ```js
 window.kobo = (() => {
+  const SITE = 'https://eu.kobotoolbox.org';
   const MAIN = ['kobo_ymbefree', 'kobo_edobro'];
   const ROLES = {
     view: ['view_asset', 'view_submissions'],
@@ -46,8 +47,8 @@ window.kobo = (() => {
 
   // Kobo request with the employee's key: {status, data}. status 0 means Kobo never answered.
   async function kobo(method, path, body) {
-    const url = new URL(path, location.origin);
-    if (url.origin !== location.origin) return {status: 0, data: {}, error: 'ключ надсилаємо лише на цей сайт'};
+    const url = new URL(path, SITE);
+    if (location.origin !== SITE || url.origin !== SITE) return {status: 0, data: {}, error: 'лише на сторінці Kobo'};
     if (!key) return {status: 0, data: {}, error: 'спершу kobo.connect(ключ)'};
     const form = body instanceof FormData;
     let r;
@@ -74,7 +75,7 @@ window.kobo = (() => {
 
   // A refused key never replaces the one already working.
   kobo.connect = async (k) => {
-    const clean = String(k).replace(/[\s​-‍⁠﻿]/g, '');
+    const clean = String(k).replace(/[\s\u200b-\u200d\u2060\ufeff]/g, '');
     if (!/^[0-9a-f]{40}$/i.test(clean)) return {ok: false, why: 'ключ не підійшов'};
     const before = key;
     key = clean;
@@ -113,8 +114,8 @@ window.kobo = (() => {
     for (const p of wanted.filter((p) => !before.has(p))) {
       // Kobo answers a permission it already has with the existing one; the re-read below decides
       await kobo('POST', `${asset}permission-assignments/`, {
-        user: `${location.origin}/api/v2/users/${user}/`,
-        permission: `${location.origin}/api/v2/permissions/${p}/`,
+        user: `${SITE}/api/v2/users/${user}/`,
+        permission: `${SITE}/api/v2/permissions/${p}/`,
       });
     }
     const after = has((await kobo('GET', asset)).data, user);
@@ -139,17 +140,18 @@ window.kobo = (() => {
     return {status: 200, data: out};
   };
 
-  // Deploys the current version: the first time POST, afterwards PATCH with that version.
+  // Deploys the current version: the first time POST, afterwards PATCH with that version (an archived form stays
+  // archived).
   kobo.deploy = async (uid) => {
     const got = await kobo('GET', `/api/v2/assets/${uid}/`);
     if (got.status !== 200) return got;
     const a = got.data;
     return a.has_deployment
-      ? kobo('PATCH', `/api/v2/assets/${uid}/deployment/`, {active: true, version_id: a.version_id})
+      ? kobo('PATCH', `/api/v2/assets/${uid}/deployment/`, {active: a.deployment__active, version_id: a.version_id})
       : kobo('POST', `/api/v2/assets/${uid}/deployment/`, {active: true});
   };
 
-  // Checks an export or import task for up to `seconds`; run again while its status is not final.
+  // Checks an export task for up to `seconds`; run again while its status is not final.
   kobo.wait = async (path, seconds = 12) => {
     const until = Date.now() + seconds * 1000;
     for (;;) {
@@ -161,8 +163,8 @@ window.kobo = (() => {
 
   // Starts saving a file from Kobo into the browser's downloads. Only started: the browser may ask or block.
   kobo.download = async (path, filename) => {
-    const url = new URL(path, location.origin);
-    if (url.origin !== location.origin || !key) return {status: 0};
+    const url = new URL(path, SITE);
+    if (location.origin !== SITE || url.origin !== SITE || !key) return {status: 0};
     let r;
     try {
       r = await fetch(url, {credentials: 'omit', headers: {Authorization: 'Token ' + key}});
@@ -274,8 +276,9 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
    `date_deployed`.
 2. Поверни вибрану версію прямо на сторінці:
    ```
-   const v = (await kobo('GET', '/api/v2/assets/<uid>/versions/<версія>/')).data.content;
-   return (await kobo('PATCH', '/api/v2/assets/<uid>/', {content: v})).status;
+   const v = await kobo('GET', '/api/v2/assets/<uid>/versions/<версія>/');
+   if (v.status !== 200) return v;
+   return (await kobo('PATCH', '/api/v2/assets/<uid>/', {content: v.data.content})).status;
    ```
 3. За потреби розгорни.
 
@@ -326,7 +329,7 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
   яку ще не розгортали, відповідей не має: Kobo відповідає 400.
 - **Великі дані:**
   - рахуй підсумки прямо на сторінці й повертай лише цифри. Бери лише потрібні питання:
-    `&fields=` + `encodeURIComponent('["oblast"]')`;
+    `&fields=` + `encodeURIComponent('["household/oblast"]')` (назва — як ключ у записі, з групою);
   - якщо потрібні самі записи, бери частинами: `&start=0&limit=100`, `&start=100…`.
 
   Як виглядають записи, описано в `data-and-reports.md`.
@@ -403,7 +406,9 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
 
 **Форма** — перед будь-якою її зміною:
 ```
-const a = (await kobo('GET', '/api/v2/assets/<uid>/')).data;
+const g = await kobo('GET', '/api/v2/assets/<uid>/');
+if (g.status !== 200) return g;
+const a = g.data;
 return JSON.stringify({uid: a.uid, name: a.name, saved: new Date().toISOString(),
   deployed_version_id: a.deployed_version_id, content: a.content});
 ```
