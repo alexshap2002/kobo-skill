@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "kobo",
-      "description": "Форми, відповіді й звіти KoboToolbox (eu.kobotoolbox.org) звичайною мовою — з копією перед кожною зміною і поширенням кожної форми на організацію.",
+      "description": "Форми, відповіді й звіти KoboToolbox (eu.kobotoolbox.org) звичайною мовою — ключ один раз, підтвердження перед видаленням, нові форми одразу в архіві й таблицях організації.",
       "source": "./plugins/kobo",
       "category": "productivity"
     }
