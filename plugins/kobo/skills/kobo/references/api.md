@@ -20,9 +20,10 @@
   працівник дав його саме для роботи з його Kobo. У відповідях працівнику ключ не повторюй.
 - Кожен фрагмент коду з цього файлу запускай як `(async () => { … })()`. Тоді працюють і `await`, і
   `return`.
-- Один запуск має тривати не довше 20 секунд. Довгі справи (вивантаження, імпорт) роби кількома запусками:
-  перший створює завдання, наступні лише перевіряють його через `kobo.wait` (розділи 3 і 8).
-- Якщо після запуску `typeof kobo` дорівнює `'undefined'`, сторінка не дала виконати код. Тоді відкрий
+- Один запуск має тривати не довше 20 секунд. Вивантаження в Excel роби кількома запусками: перший створює
+  його, наступні лише перевіряють через `kobo.wait` (розділ 8).
+- Сторінка може не дати виконати код: тоді буде помилка про Content Security Policy чи `unsafe-eval`, або
+  після запуску `typeof kobo` дорівнюватиме `'undefined'`. Тоді відкрий
   `https://eu.kobotoolbox.org/static/favicon.png` і виконай помічник там. Це той самий сайт, усе інше
   працює так само.
 - Після перезавантаження сторінки чи переходу на іншу помічник зникає. Виконай його і `kobo.connect` знову.
@@ -46,8 +47,8 @@ window.kobo = (() => {
   // Kobo request with the employee's key: {status, data}. status 0 means Kobo never answered.
   async function kobo(method, path, body) {
     const url = new URL(path, location.origin);
-    if (url.origin !== location.origin) return {status: 0, error: 'ключ надсилаємо лише на цей сайт'};
-    if (!key) return {status: 0, error: 'спершу kobo.connect(ключ)'};
+    if (url.origin !== location.origin) return {status: 0, data: {}, error: 'ключ надсилаємо лише на цей сайт'};
+    if (!key) return {status: 0, data: {}, error: 'спершу kobo.connect(ключ)'};
     const form = body instanceof FormData;
     let r;
     try {
@@ -63,7 +64,7 @@ window.kobo = (() => {
       });
     } catch (e) {
       // a change may still have reached Kobo: check before repeating it
-      return {status: 0, error: 'немає зв\'язку з Kobo', maybeSent: method !== 'GET'};
+      return {status: 0, data: {}, error: 'немає зв\'язку з Kobo', maybeSent: method !== 'GET'};
     }
     const text = await r.text();
     let data = text;
@@ -71,14 +72,18 @@ window.kobo = (() => {
     return {status: r.status, data};
   }
 
+  // A refused key never replaces the one already working.
   kobo.connect = async (k) => {
-    key = String(k).trim();
+    const clean = String(k).replace(/[\s​-‍⁠﻿]/g, '');
+    if (!/^[0-9a-f]{40}$/i.test(clean)) return {ok: false, why: 'ключ не підійшов'};
+    const before = key;
+    key = clean;
     const who = await kobo('GET', '/me/');
     if (who.status === 200 && !MAIN.includes(who.data.username)) {
       me = who.data.username;
       return {ok: true, username: me};
     }
-    key = null;
+    key = before;
     if (who.status === 200) return {ok: false, why: 'головний акаунт організації'};
     if (who.status === 401 || who.status === 403) return {ok: false, why: 'ключ не підійшов', status: who.status};
     return {ok: false, why: 'Kobo не відповідає', status: who.status};
@@ -117,7 +122,8 @@ window.kobo = (() => {
     return {ok: missing.length === 0, missing};
   };
 
-  // The employee's own forms that no organisation fully has, or that one has only partly.
+  // The employee's own forms that no organisation fully has. A form one organisation fully has is left
+  // alone, even if the other has a little: that may be on purpose.
   kobo.unshared = async () => {
     const forms = await kobo.all('/api/v2/assets/?q=asset_type:survey&limit=300');
     if (forms.status !== 200) return forms;
@@ -128,23 +134,23 @@ window.kobo = (() => {
         const got = has(a, user);
         return ROLES.full.every((p) => got.has(p)) ? 'full' : got.size ? 'partial' : 'none';
       });
-      if (!state.includes('full') || state.includes('partial')) {
-        out.push({uid: a.uid, name: a.name, kobo_ymbefree: state[0], kobo_edobro: state[1]});
-      }
+      if (!state.includes('full')) out.push({uid: a.uid, name: a.name, kobo_ymbefree: state[0], kobo_edobro: state[1]});
     }
     return {status: 200, data: out};
   };
 
   // Deploys the current version: the first time POST, afterwards PATCH with that version.
   kobo.deploy = async (uid) => {
-    const a = (await kobo('GET', `/api/v2/assets/${uid}/`)).data;
+    const got = await kobo('GET', `/api/v2/assets/${uid}/`);
+    if (got.status !== 200) return got;
+    const a = got.data;
     return a.has_deployment
       ? kobo('PATCH', `/api/v2/assets/${uid}/deployment/`, {active: true, version_id: a.version_id})
       : kobo('POST', `/api/v2/assets/${uid}/deployment/`, {active: true});
   };
 
   // Checks an export or import task for up to `seconds`; run again while its status is not final.
-  kobo.wait = async (path, seconds = 20) => {
+  kobo.wait = async (path, seconds = 12) => {
     const until = Date.now() + seconds * 1000;
     for (;;) {
       const r = await kobo('GET', path);
@@ -185,7 +191,7 @@ window.kobo = (() => {
 - **`kobo.share(uid, логін, роль)`** → `{ok, missing}`.
 - **`kobo.unshared()`** → власні форми працівника, яких організація не має повністю.
 - **`kobo.deploy(uid)`** → розгортає форму.
-- **`kobo.wait(шлях)`** → стан вивантаження чи імпорту.
+- **`kobo.wait(шлях)`** → стан вивантаження.
 - **`kobo.download(шлях, назва)`** → `{started, bytes}`. Завантаження лише запущено (розділ 8).
 
 **Повертай собі лише потрібне.** Відбирай поля через `map`, а великі дані рахуй прямо на сторінці. Тоді
@@ -214,7 +220,7 @@ return r.data.map((a) => ({uid: a.uid, name: a.name, owner: a.owner__username,
 
 **Поширення на організацію.** Форма поділена, коли в `permissions` є `kobo_ymbefree` або `kobo_edobro` з
 усіма правами `full`.
-- Усі власні форми працівника, де цього бракує: `await kobo.unshared()`. Повертає `uid`, `name` і стан для
+- Власні форми працівника, яких жодна організація не має повністю: `await kobo.unshared()`. Повертає `uid`, `name` і стан для
   кожної організації: `full`, `partial` або `none`.
 - Поділитися або доповнити права: `kobo.share(uid, 'kobo_ymbefree')` чи `kobo.share(uid, 'kobo_edobro')`.
 
@@ -232,25 +238,10 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
 
 **Копія наявної форми:** те саме тіло, але `{clone_from: '<uid>', name: 'Назва', asset_type: 'survey'}`.
 
-**З файлу XLSForm** (Excel у робочій теці):
-1. Прочитай файл і перетвори його на base64. Читати файли з робочої теки можна будь-яким способом.
-2. Перший запуск надсилає файл:
-   ```
-   const bytes = Uint8Array.from(atob(B64), (c) => c.charCodeAt(0));
-   const f = new FormData();
-   f.append('library', 'false');
-   f.append('name', 'Назва форми');
-   f.append('file', new Blob([bytes]), 'form.xlsx');
-   const t = await kobo('POST', '/api/v2/imports/', f);
-   return {status: t.status, task: t.data.uid};   // 201 — файл прийнято
-   ```
-3. Наступні запуски лише перевіряють, доки стан не стане `complete` чи `error`:
-   ```
-   const s = await kobo.wait('/api/v2/imports/<task>/');
-   if (s.data.status === 'complete') return {uid: (s.data.messages.created || s.data.messages.updated)[0].uid};
-   return {status: s.status, state: s.data.status, messages: s.data.messages};
-   ```
-   Якщо перевірка обірвалася, файл удруге не надсилай: перевір те саме завдання ще раз.
+**З файлу XLSForm** (Excel у робочій теці): прочитай аркуші `survey`, `choices` і `settings` будь-яким
+способом, перетвори їх на опис форми (`forms.md`, розділ 1) і створи форму з опису. Сам файл на сторінку не
+передавай: переписаний вручну, він легко псується. Перед створенням скажи працівнику, скільки питань
+вийшло.
 
 **Далі для кожної нової форми:**
 1. Поділися з організацією: `await kobo.share(uid, 'kobo_ymbefree')` для «Будь вільний»,
@@ -344,7 +335,7 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
 - **Записи за `_id`:**
   `'/api/v2/assets/<uid>/data/?query=' + encodeURIComponent(JSON.stringify({_id: {$in: [412345678]}}))`.
 - **Чужа форма.** Перед зміною перевір у `permissions`, що працівник має право: `change_submissions` для
-  виправлень і статусів, `delete_submissions` для видалення. Якщо права немає, копію не роби й скажи:
+  виправлень, `validate_submissions` для статусів, `delete_submissions` для видалення. Якщо права немає, копію не роби й скажи:
   «Цю форму з вами поділили лише для перегляду, тому змінити запис не вийде. Попросіть власника форми
   (<логін>) дати вам право на редагування.»
 - **Виправити значення** (питання не з повторюваної групи):
@@ -384,7 +375,7 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
    return {status: s.status, state: s.data.status};   // ще не готово — запусти знову
    ```
 3. `started` означає лише, що завантаження почалося. Скажи працівнику: «Файл "Назва форми.xlsx" має
-   з'явитися в теці «Завантаження». Якщо браузер спитає про завантаження, натисніть "Дозволити".»
+   з'явитися в теці «Завантаження». Якщо з'явиться питання про завантаження, натисніть "Дозволити".»
 4. Якщо працівник каже, що файлу немає:
    - до 200 записів — збери Excel сам з записів (розділ 7) і поклади в робочу теку;
    - більше — попроси завантажити його в самому Kobo: форма → **Data** → **Downloads**. Вивантаження, яке
@@ -395,8 +386,8 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
 - щоб зберегти файл: `kobo.download(att.download_url, att.media_file_basename)`.
 
 Фото бувають великі, тому спершу скажи, скільки їх, і завантажуй лише потрібні. Перед кількома файлами
-скажи: «Якщо браузер спитає про завантаження кількох файлів, натисніть "Дозволити"». Потім спитай, чи файли
-з'явилися.
+скажи: «Якщо з'явиться питання про завантаження кількох файлів, натисніть "Дозволити"». Потім спитай, чи
+файли з'явилися.
 
 ## 9. Копія перед зміною
 
@@ -404,15 +395,16 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
 `/ \ : * ? " < > |` на `-`. Кожна копія — це файл з датою й часом у назві, наприклад
 `2026-11-05 14-30 форма.json`.
 
-**Як.** Записуй файли так само, як будь-який файл у робочу теку. Після запису перевір, що файл є і що в
-ньому все, що ти збирався зберегти: стільки питань чи записів, скільки в Kobo. Якщо чогось бракує (результат
-зі сторінки прийшов обрізаним), бери менші частини. Поки копія неповна, зміну не роби.
+**Як.** Повертай копію зі сторінки готовим текстом (`return JSON.stringify(…)`) і записуй його у файл
+дослівно, без скорочень і «…». Записуй так само, як будь-який файл у робочу теку. Після запису перевір, що
+файл є і в ньому стільки питань чи записів, скільки в Kobo. Якщо чогось бракує (результат зі сторінки
+прийшов обрізаним), бери менші частини. Поки копія неповна, зміну не роби.
 
 **Форма** — перед будь-якою її зміною:
 ```
 const a = (await kobo('GET', '/api/v2/assets/<uid>/')).data;
-return {uid: a.uid, name: a.name, saved: new Date().toISOString(),
-  deployed_version_id: a.deployed_version_id, content: a.content};
+return JSON.stringify({uid: a.uid, name: a.name, saved: new Date().toISOString(),
+  deployed_version_id: a.deployed_version_id, content: a.content});
 ```
 Збережи це як `… форма.json`.
 
@@ -420,13 +412,12 @@ return {uid: a.uid, name: a.name, saved: new Date().toISOString(),
 - **Перед виправленням значень чи статусів** зберігай лише `_id` і старі значення того, що зміниться,
   наприклад `[{"_id": 412345678, "city": "kyiv"}]`. Файл — `… старі значення.json`. Цього досить, щоб
   повернути.
-- **Перед видаленням окремих записів** зберігай їх повністю: запит за `_id` (розділ 7), частинами по 100.
-  Файл — `… відповіді.json`.
-- **Перед видаленням форми:**
-  - до 200 відповідей — так само, як окремі записи;
-  - більше — копією буде Excel, який вивантажує сам Kobo (розділ 8): він точний і не проходить через
-    розмову. Файл ляже в «Завантаження». Видаляй форму лише після того, як працівник підтвердить, що файл
-    там є.
+- **Перед видаленням до 200 записів** (окремих чи всієї форми) зберігай їх повністю: запит за `_id`
+  (розділ 7), частинами по 100. Файл — `… відповіді.json`.
+- **Перед видаленням понад 200 записів чи форми з ними** копією буде Excel, який вивантажує сам Kobo
+  (розділ 8): він точний і не проходить через розмову. Попроси: «Файл "<назва форми>.xlsx" з'явився в теці
+  «Завантаження». Перенесіть його, будь ласка, в теку «Kobo-копії» у вашій теці «<назва теки>» і напишіть
+  "готово".» Перевір, що файл там є і не порожній, і лише тоді видаляй.
 
 Фото в копію не входять.
 

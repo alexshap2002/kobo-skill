@@ -36,17 +36,22 @@ class PageHelperTest(unittest.TestCase):
 
     def test_connect_accepts_own_key_only(self):
         result = self.run_js(f"""
-            const bad = await kobo.connect('x'.repeat(40));
+            const bad = await kobo.connect('f'.repeat(40));
+            const garbled = await kobo.connect('x'.repeat(40));
             const main = await kobo.connect({json.dumps(MAIN)});
             const unset = await kobo('GET', '/me/');
-            const own = await kobo.connect(' {OLENA}\\n');
+            const own = await kobo.connect(' {OLENA[:20]}\\u200b{OLENA[20:]}\\n');
+            const again = await kobo.connect({json.dumps(MAIN)});
             const me = await kobo('GET', '/me/');
-            return {{bad, main, unset, own, me}};""")
+            return {{bad, garbled, main, unset, own, again, me}};""")
         self.assertEqual(result["bad"], {"ok": False, "why": "ключ не підійшов", "status": 401})
+        self.assertEqual(result["garbled"], {"ok": False, "why": "ключ не підійшов"})
         self.assertEqual(result["main"], {"ok": False, "why": "головний акаунт організації"})
         self.assertEqual(result["unset"]["status"], 0, "a refused key is not kept")
-        self.assertEqual(result["own"], {"ok": True, "username": "olena"})
-        self.assertEqual(result["me"]["data"]["username"], "olena")
+        self.assertEqual(result["own"], {"ok": True, "username": "olena"}, "spaces and invisible marks are dropped")
+        self.assertFalse(result["again"]["ok"])
+        self.assertEqual(result["me"]["data"]["username"], "olena", "a refused key keeps the working one")
+        self.assertEqual(sum(1 for _, path, _ in self.fake.log if path == "/me/"), 5, "a garbled key is never sent")
 
     def test_key_never_goes_to_another_server(self):
         result = self.run_js(f"""
@@ -90,8 +95,12 @@ class PageHelperTest(unittest.TestCase):
         result = self.run_js(f"""
             await kobo.connect({json.dumps(OLENA)});
             globalThis.fetch = async () => {{ throw new TypeError('Failed to fetch'); }};
-            return await kobo('POST', '/api/v2/assets/', {{name: 'x'}});""")
-        self.assertEqual((result["status"], result["maybeSent"]), (0, True))
+            const post = await kobo('POST', '/api/v2/assets/', {{name: 'x'}});
+            const uid = post.data.uid;   // recipes read .data: this must not crash
+            return {{post, uid: uid ?? null, deploy: await kobo.deploy('aX')}};""")
+        self.assertEqual((result["post"]["status"], result["post"]["maybeSent"]), (0, True))
+        self.assertIsNone(result["uid"])
+        self.assertEqual(result["deploy"]["status"], 0)
 
     def test_share_refuses_unknown_form_and_role(self):
         result = self.run_js(f"""
@@ -140,9 +149,8 @@ class PageHelperTest(unittest.TestCase):
         self.assertEqual({f["uid"]: (f["kobo_ymbefree"], f["kobo_edobro"]) for f in result["data"]}, {
             "aNone": ("none", "none"),
             "aHalf": ("partial", "none"),
-            "aMixed": ("partial", "full"),
-        })
-        self.assertEqual({f["name"] for f in result["data"]}, {"Нічия", "Половинчаста", "Змішана"})
+        }, "a form one organisation fully has is left alone, even if the other has a little")
+        self.assertEqual({f["name"] for f in result["data"]}, {"Нічия", "Половинчаста"})
 
     def test_deploy_first_time_then_new_version(self):
         self.fake.add_form("aD", "Чернетка", deployed=False)
