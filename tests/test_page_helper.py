@@ -78,6 +78,55 @@ class PageHelperTest(unittest.TestCase):
         self.assertFalse(any("bulk" in path for _, path, _ in posts))
         self.assertEqual(self.fake.calls("DELETE"), [])
 
+    def test_no_connection_is_a_status_not_a_crash(self):
+        dead = FakeKobo()
+        dead.close()  # nothing listens on this port any more
+        script = (f"globalThis.window = globalThis;\nglobalThis.location = {{origin: {json.dumps(dead.url)}}};\n"
+                  f"{helper()}\n(async () => {{ const c = await kobo.connect({json.dumps(OLENA)});"
+                  " return c; })().then(r => console.log(JSON.stringify(r)));")
+        done = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout)["why"], "Kobo не відповідає")
+        result = self.run_js(f"""
+            await kobo.connect({json.dumps(OLENA)});
+            globalThis.fetch = async () => {{ throw new TypeError('Failed to fetch'); }};
+            return await kobo('POST', '/api/v2/assets/', {{name: 'x'}});""")
+        self.assertEqual((result["status"], result["maybeSent"]), (0, True))
+
+    def test_share_refuses_unknown_form_and_role(self):
+        result = self.run_js(f"""
+            await kobo.connect({json.dumps(OLENA)});
+            return [await kobo.share('nope', 'kobo_ymbefree'), await kobo.share('nope', 'petro', 'boss')];""")
+        self.assertEqual((result[0]["ok"], result[0]["status"]), (False, 404))
+        self.assertFalse(result[1]["ok"])
+        self.assertEqual(self.fake.calls("POST"), [])
+
+    def test_download_reports_started_not_saved(self):
+        self.fake.add_form("aX", "Форма")
+        result = self.run_js(f"""
+            const clicked = [];
+            globalThis.document = {{createElement: () => ({{click() {{ clicked.push(this.download); }}}})}};
+            await kobo.connect({json.dumps(OLENA)});
+            const r = await kobo.download('/api/v2/assets/aX.xls', 'Форма.xlsx');
+            return {{r, clicked}};""")
+        self.assertEqual(result["clicked"], ["Форма.xlsx"])
+        self.assertEqual(result["r"]["started"], "Форма.xlsx")
+        self.assertGreater(result["r"]["bytes"], 0)
+        self.assertNotIn("saved", result["r"])
+
+    def test_import_then_wait_until_complete(self):
+        result = self.run_js(f"""
+            await kobo.connect({json.dumps(OLENA)});
+            const f = new FormData();
+            f.append('library', 'false');
+            f.append('name', 'Анкета');
+            f.append('file', new Blob([new Uint8Array([1, 2, 3])]), 'form.xlsx');
+            const t = await kobo('POST', '/api/v2/imports/', f);
+            const s = await kobo.wait(`/api/v2/imports/${{t.data.uid}}/`, 10);
+            return {{created: t.status, state: s.data.status, uid: s.data.messages.created[0].uid}};""")
+        self.assertEqual((result["created"], result["state"]), (201, "complete"))
+        self.assertIn(result["uid"], self.fake.assets)
+
     def test_unshared_lists_own_forms_without_full_org_access(self):
         self.fake.add_form("aOk", "Поділена", shared={"kobo_edobro": FULL})
         self.fake.add_form("aNone", "Нічия")
