@@ -234,7 +234,7 @@ class FakeKobo:
         if rest == "" and method == "PATCH":
             if "content" in body:
                 a["content"] = body["content"]
-                vid = self._id("v")
+                vid = self._id("ver")  # not "v1": that is every form's first version
                 a["version_id"] = vid
                 a["versions"][vid] = {"content": copy.deepcopy(body["content"]), "deployed": False}
             if "name" in body:

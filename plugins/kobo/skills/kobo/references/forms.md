@@ -12,40 +12,44 @@
 
 ## 1. Формат опису форми
 
-`create --content` і `update-form --content` приймають JSON-файл з тими самими колонками, що й XLSForm:
-аркуші `survey`, `choices` і `settings`. Подавати можна у двох виглядах:
-- **простий**, як у XLSForm:
-  - `"label": "Текст"`;
-  - `"type": "select_one cities"`;
-  - `"type": "begin group"`;
-- **рідний формат Kobo:** `"label": ["Текст"]`, `"type": "select_one"`, `"select_from_list_name": "cities"`.
+Опис форми (`content`) має ті самі колонки, що й XLSForm: аркуші `survey`, `choices` і `settings`. Kobo
+приймає його у своєму рідному вигляді:
+- підписи (`label`, `hint`, `constraint_message`) — це списки, по одному тексту на кожну мову:
+  `"label": ["Текст"]`;
+- для вибору тип і список пишуться окремо: `"type": "select_one"`, `"select_from_list_name": "oblast"`;
+- групи пишуться через підкреслення: `begin_group`, `end_group`, `begin_repeat`, `end_repeat`;
+- `"translations": [null]` для однієї мови;
+- `"translated"` — назви колонок, які задано списками.
 
-Помічник сам приводить опис до формату Kobo і перевіряє його перед відправкою. Перевіряє, що:
-- технічні назви унікальні;
+Перед відправкою перевір сам, що:
+- технічні назви не повторюються;
 - для кожного `select_*` є список варіантів;
-- групи закриті.
+- кожну групу закрито.
 
 ```json
 {
   "survey": [
     {"type": "start", "name": "start"},
     {"type": "end", "name": "end"},
-    {"type": "text", "name": "full_name", "label": "Прізвище та ім'я", "required": true},
-    {"type": "integer", "name": "age", "label": "Вік", "constraint": ". >= 0 and . <= 120",
-     "constraint_message": "Вік від 0 до 120"},
-    {"type": "select_one oblast", "name": "oblast", "label": "Область"},
-    {"type": "select_multiple needs", "name": "needs", "label": "Потреби"},
-    {"type": "text", "name": "needs_other", "label": "Інше — що саме?",
+    {"type": "text", "name": "full_name", "label": ["Прізвище та ім'я"], "required": true},
+    {"type": "integer", "name": "age", "label": ["Вік"], "constraint": ". >= 0 and . <= 120",
+     "constraint_message": ["Вік від 0 до 120"]},
+    {"type": "select_one", "select_from_list_name": "oblast", "name": "oblast", "label": ["Область"]},
+    {"type": "select_multiple", "select_from_list_name": "needs", "name": "needs", "label": ["Потреби"]},
+    {"type": "text", "name": "needs_other", "label": ["Інше — що саме?"],
      "relevant": "selected(${needs}, 'other')"},
-    {"type": "acknowledge", "name": "consent", "label": "Згода на обробку персональних даних", "required": true}
+    {"type": "acknowledge", "name": "consent", "label": ["Згода на обробку персональних даних"],
+     "required": true}
   ],
   "choices": [
-    {"list_name": "oblast", "name": "kyiv", "label": "Київська"},
-    {"list_name": "oblast", "name": "lviv", "label": "Львівська"},
-    {"list_name": "needs", "name": "food", "label": "Харчування"},
-    {"list_name": "needs", "name": "other", "label": "Інше"}
+    {"list_name": "oblast", "name": "kyiv", "label": ["Київська"]},
+    {"list_name": "oblast", "name": "lviv", "label": ["Львівська"]},
+    {"list_name": "needs", "name": "food", "label": ["Харчування"]},
+    {"list_name": "needs", "name": "other", "label": ["Інше"]}
   ],
-  "settings": {}
+  "settings": {},
+  "translations": [null],
+  "translated": ["constraint_message", "label"]
 }
 ```
 
@@ -55,7 +59,7 @@
 - назва не може починатися з цифри;
 - у межах форми назви не повторюються.
 
-Ці назви стануть назвами колонок у даних і в Google Таблиці, тому міняти їх потім не можна (див. розділ 7).
+Ці назви стануть назвами колонок у даних і в Google Таблиці, тому міняти їх потім не варто (див. розділ 7).
 
 **Назви варіантів (`name` у `choices`)** теж пиши латиницею, без пробілів. Підписи (`label`) можна писати
 будь-якою мовою.
@@ -67,8 +71,8 @@
 | `text` | текст |
 | `integer`, `decimal` | ціле / дробове число |
 | `date`, `time`, `datetime` | дата, час |
-| `select_one <список>` | один варіант |
-| `select_multiple <список>` | кілька варіантів (у даних через пробіл) |
+| `select_one` | один варіант (`select_from_list_name` — список) |
+| `select_multiple` | кілька варіантів (у даних через пробіл) |
 | `geopoint` | координати |
 | `image`, `audio`, `video`, `file` | фото, звук, відео, файл |
 | `note` | лише текст для того, хто заповнює |
@@ -99,12 +103,12 @@
 ## 4. Групи й повторювані групи
 
 ```json
-{"type": "begin_group", "name": "household", "label": "Домогосподарство", "appearance": "field-list"},
-{"type": "integer", "name": "hh_size", "label": "Скільки людей?"},
+{"type": "begin_group", "name": "household", "label": ["Домогосподарство"], "appearance": "field-list"},
+{"type": "integer", "name": "hh_size", "label": ["Скільки людей?"]},
 {"type": "end_group"},
-{"type": "begin_repeat", "name": "members", "label": "Член родини", "repeat_count": "${hh_size}"},
-{"type": "text", "name": "m_name", "label": "Ім'я"},
-{"type": "integer", "name": "m_age", "label": "Вік"},
+{"type": "begin_repeat", "name": "members", "label": ["Член родини"], "repeat_count": "${hh_size}"},
+{"type": "text", "name": "m_name", "label": ["Ім'я"]},
+{"type": "integer", "name": "m_age", "label": ["Вік"]},
 {"type": "end_repeat"}
 ```
 
@@ -115,6 +119,7 @@
 
 ```json
 "translations": ["Українська (uk)", "English (en)"],
+"translated": ["label"],
 "survey": [{"type": "text", "name": "q1", "label": ["Ім'я", "Name"]}]
 ```
 
@@ -125,19 +130,15 @@
 
 1. З'ясуй, що має збирати форма: хто її заповнює, які питання, які варіанти відповідей. Запропонуй чернетку
    словами або таблицею і узгодь її з працівником.
-2. **Запитай організацію** (правило Р2).
-3. Збережи опис у тимчасовий JSON-файл і виконай:
-   `"$KOBO" create --name "Назва" --content файл.json --org <орг>`. Якщо форма готова до роботи, додай
-   `--deploy`.
-4. Якщо працівник має готовий файл XLSForm (Excel), подай його так: `create --name … --xlsx файл.xlsx --org …`.
-5. Скажи, що вийшло. Якщо форму не розгорнуто, нагадай про розгортання: без нього не можна збирати
+2. Запитай, для якої організації форма (SKILL.md, «Захист», п. 2).
+3. Створи форму, поділися нею з організацією і, якщо вона готова, розгорни (`api.md`, розділ 3).
+   Готовий файл XLSForm (Excel) працівника можна подати як є.
+4. Скажи, що вийшло. Якщо форму не розгорнуто, нагадай про розгортання: без нього не можна збирати
    відповіді й немає таблиці.
 
 ## 7. Зміна наявної форми
 
-1. Отримай поточний опис форми:
-   `"$KOBO" api GET /api/v2/assets/<uid>/ --out форма.json`. У файлі буде вся форма. `update-form` приймає
-   такий файл як є, тож можна правити поле `content` прямо в ньому.
+1. Візьми поточний опис (`content`) з подробиць форми (`api.md`, розділ 2).
 2. Внеси зміни. Безпечно:
    - додавати питання й варіанти;
    - змінювати підписи, підказки, умови та порядок.
@@ -149,22 +150,14 @@
    - переносити питання в іншу групу, бо тоді змінюється назва колонки.
 
    Замість цього додай нове питання, а старе приховай, наприклад: `"relevant": "false()"`.
-3. Виконай `"$KOBO" update-form <uid> --content форма.json`. Помічник сам:
-   - перевірить зміни на ризиковані;
-   - зробить копію;
-   - збереже форму.
-
-   Якщо форма вже розгорнута і працівник хоче, щоб зміни запрацювали одразу, додай `--deploy`.
-4. Якщо помічник відмовив через ризиковану зміну, перекажи працівнику причину своїми словами. З `--force`
-   повторюй лише після його «так».
-5. Якщо зміна вийшла невдалою, поверни форму: `"$KOBO" restore-form <uid> --backup latest`. Список копій:
-   `backups <uid>`. Помічник спершу зробить нову копію, тож і це повернення можна скасувати.
+3. Збережи і, якщо треба, розгорни (`api.md`, розділ 4).
+4. Якщо зміна вийшла невдалою, поверни попередню версію: Kobo зберігає всі версії форми (`api.md`, розділ 4).
 
 ## 8. Посилання для заповнення
 
-Після розгортання у відповіді `"$KOBO" api GET /api/v2/assets/<uid>/` є поле `deployment__links`:
+Після розгортання в подробицях форми є `deployment__links` (`api.md`, розділ 5):
 - `url` — веб-форма для заповнення в браузері (Enketo);
 - `offline_url` — та сама форма для роботи без інтернету.
 
 У KoboCollect збирачі додають сервер `https://kc-eu.kobotoolbox.org` і свій логін, а потім завантажують
-форму («Get Blank Form»). Бачать вони лише ті форми, якими з ними поділилися (`share-user`).
+форму («Get Blank Form»). Бачать вони лише ті форми, якими з ними поділилися (`api.md`, розділ 6).

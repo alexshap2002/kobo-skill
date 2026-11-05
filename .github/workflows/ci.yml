@@ -9,34 +9,19 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        # 3.9 is the floor (the Python that ships with Mac command line tools). Hosted runners offer it
-        # only on Windows, and this account gets no macOS runners, so Mac (3.9 and 3.12) is tested
-        # locally before each push: python3 -m unittest discover -s tests
-        include:
-          - {os: windows-latest, python: "3.9"}
-          - {os: windows-latest, python: "3.12"}
-          - {os: ubuntu-latest, python: "3.12"}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
-      - name: Unit tests (fake Kobo)
-        shell: bash
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Page helper against a fake Kobo, skill docs
         run: python -m unittest discover -s tests -v
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Shell scripts
-        run: shellcheck plugins/kobo/skills/kobo/scripts/kobo plugins/kobo/hooks/session-start
       - name: Manifests are valid JSON
-        run: for f in .claude-plugin/marketplace.json plugins/kobo/.claude-plugin/plugin.json plugins/kobo/hooks/hooks.json; do python3 -m json.tool "$f" >/dev/null || exit 1; done
+        run: for f in .claude-plugin/marketplace.json plugins/kobo/.claude-plugin/plugin.json; do python -m json.tool "$f" >/dev/null || exit 1; done

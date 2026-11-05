@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# SessionStart: the daily check that every form the employee owns is shared with an organisation.
-# Its output becomes context for Claude. Silent when Kobo is not set up, Python is missing or Kobo is down.
-case "$0" in
-  */*|*\\*) hooks="${0%[/\\]*}" ;;
-  *) hooks=. ;;
-esac
-"${BASH:-bash}" "$hooks/../skills/kobo/scripts/kobo" check-sharing --daily 2>/dev/null
-exit 0
