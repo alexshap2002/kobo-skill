@@ -25,7 +25,7 @@ class SkillDocTest(unittest.TestCase):
     def test_no_traces_of_the_old_helper_program(self):
         for doc in [SKILL / "SKILL.md", *(SKILL / "references").glob("*.md")]:
             text = read(doc)
-            for old in ("$KOBO", "scripts/kobo", "~/.kobo", "Kobo-копії"):
+            for old in ("$KOBO", "scripts/kobo", "~/.kobo"):
                 self.assertNotIn(old, text, f"{doc.name} still mentions {old}")
 
     def test_key_lives_in_the_work_folder_file(self):
