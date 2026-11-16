@@ -36,14 +36,13 @@
   "survey": [
     {"type": "start", "name": "start"},
     {"type": "end", "name": "end"},
+    {"type": "acknowledge", "name": "consent", "label": ["Натискаючи тут, я даю згоду на обробку моїх персональних даних"], "required": true},
     {"type": "text", "name": "full_name", "label": ["Прізвище та ім'я"], "required": true},
     {"type": "integer", "name": "visits", "label": ["Скільки разів відвідували заняття?"], "constraint": ". >= 0",
      "constraint_message": ["Введіть 0 або більше"]},
     {"type": "select_multiple", "select_from_list_name": "needs", "name": "needs", "label": ["Потреби"]},
     {"type": "text", "name": "needs_other", "label": ["Інше — що саме?"],
-     "relevant": "selected(${needs}, 'other')"},
-    {"type": "acknowledge", "name": "consent", "label": ["Згода на обробку персональних даних"],
-     "required": true}
+     "relevant": "selected(${needs}, 'other')"}
   ],
   "choices": [
     {"list_name": "needs", "name": "food", "label": ["Харчування"]},

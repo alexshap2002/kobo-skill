@@ -57,6 +57,13 @@ class SkillDocTest(unittest.TestCase):
         for c in choices:
             self.assertEqual(len(c["label"]), len(content["translations"]), c["name"])
 
+    def test_every_form_gets_the_same_consent_question(self):
+        row = ('{"type": "acknowledge", "name": "consent", "label": ["Натискаючи тут, я даю згоду на обробку моїх '
+               'персональних даних"], "required": true}')
+        json.loads(row)
+        self.assertIn(row, read(SKILL / "SKILL.md"))
+        self.assertIn(row, read(SKILL / "references/forms.md"), "the example form uses the same question")
+
 
 if __name__ == "__main__":
     unittest.main()
