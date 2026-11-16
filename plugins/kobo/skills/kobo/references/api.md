@@ -140,6 +140,21 @@ window.kobo = (() => {
     return {status: 200, data: out};
   };
 
+  // Projects named in the descriptions of every form the employee sees (exactly as written), and the employee's own
+  // forms without one.
+  kobo.projects = async () => {
+    const forms = await kobo.all('/api/v2/assets/?q=asset_type:survey&limit=300');
+    if (forms.status !== 200) return forms;
+    const projects = {};
+    const missing = [];
+    for (const a of forms.data) {
+      const d = (a.settings || {}).description || '';
+      if (d.trim()) projects[d] = (projects[d] || 0) + 1;
+      else if (a.owner__username === me) missing.push({uid: a.uid, name: a.name});
+    }
+    return {status: 200, projects, missing};
+  };
+
   // Deploys the current version: the first time POST, afterwards PATCH with that version (an archived form stays
   // archived).
   kobo.deploy = async (uid) => {
@@ -204,7 +219,7 @@ window.kobo = (() => {
 ```
 const r = await kobo.all('/api/v2/assets/?q=asset_type:survey&limit=300');
 return r.data.map((a) => ({uid: a.uid, name: a.name, owner: a.owner__username,
-  status: a.deployment_status, answers: a.deployment__submission_count}));
+  status: a.deployment_status, answers: a.deployment__submission_count, project: (a.settings || {}).description}));
 ```
 
 - `status`: `deployed` — розгорнута, `draft` — чернетка, `archived` — архівна.
@@ -212,7 +227,7 @@ return r.data.map((a) => ({uid: a.uid, name: a.name, owner: a.owner__username,
 - Працівник називає форму назвою; знайди її `uid` у цьому списку. Якщо збігів кілька, перепитай.
 
 Подробиці: `kobo('GET', '/api/v2/assets/<uid>/')`. Найпотрібніше там:
-- `content` — опис форми (чернетка, яку редагують);
+- `content` — вміст форми: питання й варіанти (чернетка, яку редагують);
 - `has_deployment`, `version_id`, `deployed_version_id`;
 - `permissions` — хто має доступ: `user` і `permission` закінчуються логіном і назвою права;
 - `deployment__links` — посилання для заповнення.
@@ -226,41 +241,52 @@ return r.data.map((a) => ({uid: a.uid, name: a.name, owner: a.owner__username,
   кожної організації: `full`, `partial` або `none`.
 - Поділитися або доповнити права: `kobo.share(uid, 'kobo_ymbefree')` чи `kobo.share(uid, 'kobo_edobro')`.
 
+**Проєкт форми** — це її опис (`settings.description`). Проєкти й власні форми без проєкту:
+`await kobo.projects()`. Записати проєкт у власну форму:
+```
+const project = 'Назва проєкту';
+const r = await kobo('PATCH', '/api/v2/assets/<uid>/', {settings: {description: project}});
+return {status: r.status, saved: r.status === 200 && (r.data.settings || {}).description === project};
+```
+Решту налаштувань форми Kobo лишає. Нової версії це не створює, розгортати не треба.
+
 ## 3. Створення форми
 
-Спершу запитай, для якої організації форма (SKILL.md, «Кожна форма — в організації»).
+Спершу запитай про організацію і проєкт і звір форму із золотим стандартом (SKILL.md).
 
-**З опису** (формат — у `forms.md`):
+**З вмісту** (формат — у `forms.md`):
 ```
-const r = await kobo('POST', '/api/v2/assets/', {name: 'Назва', asset_type: 'survey', content});
-return {status: r.status, uid: r.data.uid};   // 201 — створено
+const project = 'Назва проєкту';   // до літери як у kobo.projects()
+const r = await kobo('POST', '/api/v2/assets/', {name: 'Назва', asset_type: 'survey', content, settings: {description: project}});
+return {status: r.status, uid: r.data.uid, project: (r.data.settings || {}).description};   // 201 — створено
 ```
-Під час створення Kobo опис не перевіряє. Помилки в описі він назве при розгортанні: відповідь 400 з
-поясненням. Тоді виправ опис і розгорни ще раз.
+Якщо `project` не збігся, запиши проєкт рецептом із розділу 2. Під час створення Kobo вміст не перевіряє.
+Помилки він назве при розгортанні: відповідь 400 з поясненням. Тоді виправ вміст і розгорни ще раз.
 
-**Копія наявної форми:** те саме тіло, але `{clone_from: '<uid>', name: 'Назва', asset_type: 'survey'}`.
+**Копія наявної форми:** те саме тіло, але `{clone_from: '<uid>', name: 'Назва', asset_type: 'survey',
+settings: {description: project}}`.
 
 **З файлу XLSForm** (Excel у робочій теці): прочитай аркуші `survey`, `choices` і `settings` будь-яким
-способом, перетвори їх на опис форми (`forms.md`, розділ 1) і створи форму з опису. Сам файл на сторінку не
+способом, перетвори їх на вміст форми (`forms.md`, розділ 1) і створи форму з нього. Сам файл на сторінку не
 передавай: переписаний вручну, він легко псується. Перед створенням скажи працівнику, скільки питань
 вийшло.
 
 **Далі для кожної нової форми:**
 1. Поділися з організацією: `await kobo.share(uid, 'kobo_ymbefree')` для «Будь вільний»,
    `'kobo_edobro'` для «Є добро», для обох — обидва виклики. Перевір, що `ok: true`.
-2. Якщо форма готова до роботи, розгорни її: `await kobo.deploy(uid)`. Відповідь 200 чи 201 означає успіх.
+2. Розгорни її: `await kobo.deploy(uid)`. Відповідь 200 чи 201 означає успіх. Дай посилання (розділ 5).
 
 ## 4. Зміна форми і повернення до попередньої версії
 
 1. Збережи копію форми (розділ 9).
-2. Знайди місце зміни. Повертай собі лише короткий перелік питань, а не весь опис:
+2. Знайди місце зміни. Повертай собі лише короткий перелік питань, а не весь вміст:
    ```
    const c = (await kobo('GET', '/api/v2/assets/<uid>/')).data.content;
    return c.survey.map((q, i) => [i, q.type, q.name, (q.label || [])[0]]);
    ```
 3. Якщо у формі вже є відповіді (`deployment__submission_count` більше 0), вважай, що відповіді є на всі
    наявні питання й варіанти. Ризиковану зміну спершу обговори з працівником (SKILL.md, «Захист», п. 3).
-4. Зміну роби на сторінці одним фрагментом. Опис форми в розмову не переписуй: так ненароком не зіпсуєш
+4. Зміну роби на сторінці одним фрагментом. Вміст форми в розмову не переписуй: так ненароком не зіпсуєш
    інші питання.
    ```
    const path = '/api/v2/assets/<uid>/';
@@ -287,7 +313,7 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
 
 ## 5. Розгортання, архів, посилання
 
-- **Розгорнути** (нову форму чи нову версію): `kobo.deploy(uid)`. Відповідь 400 означає помилку в описі
+- **Розгорнути** (нову форму чи нову версію): `kobo.deploy(uid)`. Відповідь 400 означає помилку у вмісті
   форми: Kobo пояснить, що не так.
 - **Архівувати** (форма перестає приймати відповіді):
   `kobo('PATCH', '/api/v2/assets/<uid>/deployment/', {active: false})`.
@@ -329,7 +355,7 @@ return {status: r.status, uid: r.data.uid};   // 201 — створено
   яку ще не розгортали, відповідей не має: Kobo відповідає 400.
 - **Великі дані:**
   - рахуй підсумки прямо на сторінці й повертай лише цифри. Бери лише потрібні питання:
-    `&fields=` + `encodeURIComponent('["household/oblast"]')` (назва — як ключ у записі, з групою);
+    `&fields=` + `encodeURIComponent('["oblast"]')` (назва — як ключ у записі; питання з групи — з групою: `contacts/phone`);
   - якщо потрібні самі записи, бери частинами: `&start=0&limit=100`, `&start=100…`.
 
   Як виглядають записи, описано в `data-and-reports.md`.

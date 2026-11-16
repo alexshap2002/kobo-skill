@@ -197,6 +197,42 @@ class PageHelperTest(unittest.TestCase):
         self.assertEqual(second[2]["version_id"], self.fake.assets["aD"]["deployed_version_id"])
         self.assertNotEqual(second[2]["version_id"], "v1")
 
+    def test_projects_counts_descriptions_and_lists_own_forms_without_one(self):
+        self.fake.add_form("aA", "Батьки", description="Психологічна підтримка")
+        self.fake.add_form("aB", "Діти", description="Психологічна підтримка")
+        self.fake.add_form("aS", "З пробілом", description="Психологічна підтримка ")
+        self.fake.add_form("aC", "Пробіли", description="  ")
+        self.fake.add_form("aD", "Без опису")
+        self.fake.add_form("aE", "Чужа", owner="petro", description="Гуманітарна допомога",
+                           shared={"olena": ["view_asset"]})
+        self.fake.add_form("aF", "Чужа без опису", owner="petro", shared={"olena": ["view_asset"]})
+        result = self.run_js(f"""
+            await kobo.connect({json.dumps(OLENA)});
+            return await kobo.projects();""")
+        self.assertEqual(result["projects"], {"Психологічна підтримка": 2, "Психологічна підтримка ": 1,
+                                              "Гуманітарна допомога": 1}, "a stray space is a different filter")
+        self.assertEqual({f["uid"]: f["name"] for f in result["missing"]}, {"aC": "Пробіли", "aD": "Без опису"},
+                         "only the employee's own forms can be given a project")
+
+    def test_project_recipe_writes_description_and_keeps_other_settings(self):
+        self.fake.add_form("aP", "Форма", description="старий текст", settings={"sector": "Humanitarian"})
+        code = (recipe("'PATCH', '/api/v2/assets/<uid>/', {settings")
+                .replace("<uid>", "aP").replace("Назва проєкту", "Психологічна підтримка"))
+        result = self.run_js(f"await kobo.connect({json.dumps(OLENA)});\n{code}")
+        self.assertEqual(result, {"status": 200, "saved": True})
+        self.assertEqual(self.fake.assets["aP"]["settings"],
+                         {"sector": "Humanitarian", "description": "Психологічна підтримка"})
+        self.assertEqual(self.fake.calls(contains="/deployment/"), [], "a description needs no deploy")
+
+    def test_create_recipe_writes_the_project(self):
+        code = recipe("asset_type: 'survey', content, settings").replace("Назва проєкту", "Психологічна підтримка")
+        result = self.run_js(f"""
+            await kobo.connect({json.dumps(OLENA)});
+            const content = {{survey: [], choices: [], settings: {{}}}};
+            {code}""")
+        self.assertEqual((result["status"], result["project"]), (201, "Психологічна підтримка"))
+        self.assertEqual(self.fake.assets[result["uid"]]["settings"]["description"], "Психологічна підтримка")
+
     def test_deploying_an_archived_form_keeps_it_archived(self):
         self.fake.add_form("aA", "Архівна")
         self.fake.assets["aA"]["active"] = False

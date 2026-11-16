@@ -89,10 +89,12 @@ class FakeKobo:
     # --- fixtures -----------------------------------------------------------------------------------
 
     def add_form(self, uid: str, name: str = "Анкета", owner: str = "olena", content: dict | None = None,
-                 deployed: bool = True, submissions: list[dict] | None = None, shared: dict | None = None) -> dict:
+                 deployed: bool = True, submissions: list[dict] | None = None, shared: dict | None = None,
+                 description: str | None = None, settings: dict | None = None) -> dict:
         content = copy.deepcopy(content or simple_content())
         asset = {
             "uid": uid, "name": name, "owner": owner, "content": content, "version_id": "v1",
+            "settings": {**(settings or {}), **({"description": description} if description is not None else {})},
             "deployed_version_id": "v1" if deployed else None, "has_deployment": deployed,
             "active": deployed,
             "versions": {"v1": {"content": copy.deepcopy(content), "deployed": deployed}},
@@ -125,6 +127,7 @@ class FakeKobo:
         out = {
             "url": f"{base}/api/v2/assets/{a['uid']}/", "uid": a["uid"], "name": a["name"],
             "owner__username": a["owner"], "asset_type": "survey", "version_id": a["version_id"],
+            "settings": a["settings"],
             "deployed_version_id": a["deployed_version_id"], "has_deployment": a["has_deployment"],
             "deployment__active": a["active"], "deployment_status": status,
             "deployment__submission_count": len(self.data.get(a["uid"], [])),
@@ -203,7 +206,8 @@ class FakeKobo:
                 content = copy.deepcopy(self.assets[body["clone_from"]]["content"])
             else:
                 content = body["content"]
-            self.add_form(uid, body.get("name", ""), owner=user, content=content, deployed=False)
+            self.add_form(uid, body.get("name", ""), owner=user, content=content, deployed=False,
+                          settings=body.get("settings"))
             return self._send(h, 201, self._asset_json(self.assets[uid]))
         if path == "/api/v2/imports/" and method == "POST":
             iid = self._id("imp")
@@ -239,6 +243,8 @@ class FakeKobo:
                 a["versions"][vid] = {"content": copy.deepcopy(body["content"]), "deployed": False}
             if "name" in body:
                 a["name"] = body["name"]
+            if "settings" in body:
+                a["settings"] = {**a["settings"], **body["settings"]}  # Kobo merges, as validate_settings does
             return self._send(h, 200, self._asset_json(a))
         if rest == "" and method == "DELETE":
             del self.assets[uid]
