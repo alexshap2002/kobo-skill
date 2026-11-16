@@ -64,6 +64,9 @@ class SkillDocTest(unittest.TestCase):
         self.assertIn(row, read(SKILL / "SKILL.md"))
         self.assertIn(row, read(SKILL / "references/forms.md"), "the example form uses the same question")
 
+    def test_a_form_without_project_gets_one_fixed_name(self):
+        self.assertIn("рівно «Без проєкту»", read(SKILL / "SKILL.md"))
+
 
 if __name__ == "__main__":
     unittest.main()
